@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   FileSpreadsheet,
@@ -10,8 +10,11 @@ import {
   Settings,
   ChevronLeft,
   FolderOutput,
+  LogOut,
 } from "lucide-react";
 import wekezaLogo from "@/assets/wekeza-logo.png";
+import { useAuth } from "@/hooks/useAuth";
+import { toast } from "sonner";
 
 const navItems = [
   { icon: LayoutDashboard, label: "Dashboard", path: "/" },
@@ -25,7 +28,20 @@ const navItems = [
 
 export default function AppSidebar() {
   const location = useLocation();
+  const navigate = useNavigate();
+  const { user, signOut } = useAuth();
   const [collapsed, setCollapsed] = useState(false);
+
+  const handleSignOut = async () => {
+    await signOut();
+    toast.success("Signed out");
+    navigate("/auth", { replace: true });
+  };
+
+  const initials = (user?.user_metadata?.full_name || user?.email || "U")
+    .split(/[\s@]/)[0]
+    .slice(0, 2)
+    .toUpperCase();
 
   return (
     <motion.aside
@@ -88,15 +104,46 @@ export default function AppSidebar() {
         })}
       </nav>
 
-      {/* Collapse Toggle */}
-      <button
-        onClick={() => setCollapsed(!collapsed)}
-        className="p-3 border-t border-sidebar-border flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors"
-      >
-        <motion.div animate={{ rotate: collapsed ? 180 : 0 }}>
-          <ChevronLeft className="h-4 w-4" />
-        </motion.div>
-      </button>
+      {/* User + Collapse */}
+      <div className="border-t border-sidebar-border">
+        {user && (
+          <div className="px-3 py-3 flex items-center gap-3">
+            <div className="h-8 w-8 rounded-full bg-primary/20 text-primary flex items-center justify-center text-xs font-bold flex-shrink-0">
+              {initials}
+            </div>
+            <AnimatePresence>
+              {!collapsed && (
+                <motion.div
+                  initial={{ opacity: 0, width: 0 }}
+                  animate={{ opacity: 1, width: "auto" }}
+                  exit={{ opacity: 0, width: 0 }}
+                  className="flex-1 min-w-0 overflow-hidden"
+                >
+                  <p className="text-xs font-medium text-foreground truncate">
+                    {user.user_metadata?.full_name || user.email?.split("@")[0]}
+                  </p>
+                  <p className="text-[10px] text-muted-foreground truncate">{user.email}</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+            <button
+              onClick={handleSignOut}
+              title="Sign out"
+              className="p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors flex-shrink-0"
+            >
+              <LogOut className="h-4 w-4" />
+            </button>
+          </div>
+        )}
+        <button
+          onClick={() => setCollapsed(!collapsed)}
+          className="w-full p-3 border-t border-sidebar-border flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors"
+        >
+          <motion.div animate={{ rotate: collapsed ? 180 : 0 }}>
+            <ChevronLeft className="h-4 w-4" />
+          </motion.div>
+        </button>
+      </div>
     </motion.aside>
   );
 }

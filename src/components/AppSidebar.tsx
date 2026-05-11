@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   FileSpreadsheet,
@@ -10,8 +10,11 @@ import {
   Settings,
   ChevronLeft,
   FolderOutput,
+  LogOut,
 } from "lucide-react";
 import wekezaLogo from "@/assets/wekeza-logo.png";
+import { useAuth } from "@/hooks/useAuth";
+import { toast } from "sonner";
 
 const navItems = [
   { icon: LayoutDashboard, label: "Dashboard", path: "/" },

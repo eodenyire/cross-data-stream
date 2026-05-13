@@ -11,12 +11,14 @@ import {
   ChevronLeft,
   FolderOutput,
   LogOut,
+  ShieldCheck,
 } from "lucide-react";
 import wekezaLogo from "@/assets/wekeza-logo.png";
 import { useAuth } from "@/hooks/useAuth";
+import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { toast } from "sonner";
 
-const navItems = [
+const baseNavItems = [
   { icon: LayoutDashboard, label: "Dashboard", path: "/" },
   { icon: FileSpreadsheet, label: "File Converter", path: "/convert" },
   { icon: Database, label: "Connections", path: "/connections" },
@@ -30,7 +32,11 @@ export default function AppSidebar() {
   const location = useLocation();
   const navigate = useNavigate();
   const { user, signOut } = useAuth();
+  const { isAdmin } = useIsAdmin();
   const [collapsed, setCollapsed] = useState(false);
+  const navItems = isAdmin
+    ? [...baseNavItems, { icon: ShieldCheck, label: "Admin", path: "/admin" }]
+    : baseNavItems;
 
   const handleSignOut = async () => {
     await signOut();

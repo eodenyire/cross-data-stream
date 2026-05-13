@@ -13,6 +13,7 @@ import TableMapping from "./pages/TableMapping";
 import SQLWorkspace from "./pages/SQLWorkspace";
 import Ingestion from "./pages/Ingestion";
 import SettingsPage from "./pages/Settings";
+import Admin from "./pages/Admin";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -35,6 +36,7 @@ const App = () => (
             <Route path="/sql" element={protect(<SQLWorkspace />)} />
             <Route path="/ingestion" element={protect(<Ingestion />)} />
             <Route path="/settings" element={protect(<SettingsPage />)} />
+            <Route path="/admin" element={protect(<Admin />)} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </AuthProvider>

@@ -10,10 +10,137 @@ export type Database = {
   // Allows to automatically instantiate createClient with right options
   // instead of createClient<Database, { PostgrestVersion: 'XX' }>(URL, KEY)
   __InternalSupabase: {
-    PostgrestVersion: "14.15"
+    PostgrestVersion: "14.5"
   }
   public: {
     Tables: {
+      db_connection_secrets: {
+        Row: {
+          connection_id: string
+          password: string
+        }
+        Insert: {
+          connection_id: string
+          password: string
+        }
+        Update: {
+          connection_id?: string
+          password?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "db_connection_secrets_connection_id_fkey"
+            columns: ["connection_id"]
+            isOneToOne: true
+            referencedRelation: "db_connections"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      db_connections: {
+        Row: {
+          created_at: string
+          created_by: string | null
+          database_name: string | null
+          db_type: string
+          host: string | null
+          id: string
+          is_internal: boolean
+          last_tested_at: string | null
+          name: string
+          port: number | null
+          status: string
+          status_message: string | null
+          use_ssl: boolean
+          username: string | null
+        }
+        Insert: {
+          created_at?: string
+          created_by?: string | null
+          database_name?: string | null
+          db_type: string
+          host?: string | null
+          id?: string
+          is_internal?: boolean
+          last_tested_at?: string | null
+          name: string
+          port?: number | null
+          status?: string
+          status_message?: string | null
+          use_ssl?: boolean
+          username?: string | null
+        }
+        Update: {
+          created_at?: string
+          created_by?: string | null
+          database_name?: string | null
+          db_type?: string
+          host?: string | null
+          id?: string
+          is_internal?: boolean
+          last_tested_at?: string | null
+          name?: string
+          port?: number | null
+          status?: string
+          status_message?: string | null
+          use_ssl?: boolean
+          username?: string | null
+        }
+        Relationships: []
+      }
+      etl_jobs: {
+        Row: {
+          connection_id: string | null
+          created_at: string
+          created_by: string | null
+          dest_count: number | null
+          finished_at: string | null
+          id: string
+          job_type: string
+          message: string | null
+          source_count: number | null
+          status: string
+          target: string | null
+          title: string
+        }
+        Insert: {
+          connection_id?: string | null
+          created_at?: string
+          created_by?: string | null
+          dest_count?: number | null
+          finished_at?: string | null
+          id?: string
+          job_type: string
+          message?: string | null
+          source_count?: number | null
+          status?: string
+          target?: string | null
+          title: string
+        }
+        Update: {
+          connection_id?: string | null
+          created_at?: string
+          created_by?: string | null
+          dest_count?: number | null
+          finished_at?: string | null
+          id?: string
+          job_type?: string
+          message?: string | null
+          source_count?: number | null
+          status?: string
+          target?: string | null
+          title?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "etl_jobs_connection_id_fkey"
+            columns: ["connection_id"]
+            isOneToOne: false
+            referencedRelation: "db_connections"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       profiles: {
         Row: {
           avatar_url: string | null
@@ -43,6 +170,72 @@ export type Database = {
           updated_at?: string
         }
         Relationships: []
+      }
+      table_mappings: {
+        Row: {
+          created_at: string
+          created_by: string | null
+          dest_connection_id: string
+          dest_table: string
+          id: string
+          last_dest_count: number | null
+          last_message: string | null
+          last_run_at: string | null
+          last_source_count: number | null
+          source_columns: string
+          source_connection_id: string
+          source_table: string
+          status: string
+          where_clause: string | null
+        }
+        Insert: {
+          created_at?: string
+          created_by?: string | null
+          dest_connection_id: string
+          dest_table: string
+          id?: string
+          last_dest_count?: number | null
+          last_message?: string | null
+          last_run_at?: string | null
+          last_source_count?: number | null
+          source_columns?: string
+          source_connection_id: string
+          source_table: string
+          status?: string
+          where_clause?: string | null
+        }
+        Update: {
+          created_at?: string
+          created_by?: string | null
+          dest_connection_id?: string
+          dest_table?: string
+          id?: string
+          last_dest_count?: number | null
+          last_message?: string | null
+          last_run_at?: string | null
+          last_source_count?: number | null
+          source_columns?: string
+          source_connection_id?: string
+          source_table?: string
+          status?: string
+          where_clause?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "table_mappings_dest_connection_id_fkey"
+            columns: ["dest_connection_id"]
+            isOneToOne: false
+            referencedRelation: "db_connections"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "table_mappings_source_connection_id_fkey"
+            columns: ["source_connection_id"]
+            isOneToOne: false
+            referencedRelation: "db_connections"
+            referencedColumns: ["id"]
+          },
+        ]
       }
       user_roles: {
         Row: {

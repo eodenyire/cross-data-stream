@@ -1,0 +1,284 @@
+import { createClient } from "npm:@supabase/supabase-js@2";
+import postgres from "npm:postgres@3.4.4";
+import mysql from "npm:mysql2@3.11.0/promise";
+
+const cors = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
+};
+
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { ...cors, "Content-Type": "application/json" } });
+
+const admin = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+
+type Conn = {
+  id: string; name: string; db_type: string; host: string | null; port: number | null;
+  database_name: string | null; username: string | null; use_ssl: boolean; is_internal: boolean;
+};
+
+const IDENT = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/;
+const MAX_ROWS = 5000;
+
+function checkIdent(name: string) {
+  if (!IDENT.test(name)) throw new Error(`Invalid table name "${name}". Use letters, numbers and underscores.`);
+  return name;
+}
+function cleanCol(c: string) {
+  const s = String(c).trim().replace(/[^A-Za-z0-9_]/g, "_").replace(/^(\d)/, "_$1").toLowerCase();
+  return s || "col";
+}
+function guardSql(sql: string) {
+  if (/\b(reset|set)\s+(session\s+)?role\b|\bset\s+session\s+authorization\b/i.test(sql))
+    throw new Error("Changing roles is not allowed.");
+}
+
+interface Driver {
+  query(sql: string, params?: unknown[]): Promise<Record<string, unknown>[]>;
+  quote(id: string): string;
+  close(): Promise<void>;
+  internal: boolean;
+}
+
+async function openDriver(conn: Conn): Promise<Driver> {
+  if (conn.is_internal) {
+    const sql = postgres(Deno.env.get("SUPABASE_DB_URL")!, { max: 1, prepare: false });
+    const q = (id: string) => id.split(".").map((p) => `"${p}"`).join(".");
+    return {
+      internal: true,
+      quote: q,
+      async query(text, params = []) {
+        guardSql(text);
+        return await sql.begin(async (tx) => {
+          await tx.unsafe("SET LOCAL ROLE datahub_staging");
+          await tx.unsafe("SET LOCAL search_path TO staging");
+          await tx.unsafe("SET LOCAL statement_timeout = '60s'");
+          const r = await tx.unsafe(text, params as never[]);
+          return [...r] as Record<string, unknown>[];
+        });
+      },
+      close: () => sql.end(),
+    };
+  }
+  const { data: sec } = await admin.from("db_connection_secrets").select("password").eq("connection_id", conn.id).maybeSingle();
+  const password = sec?.password ?? "";
+  const t = conn.db_type;
+  if (t === "PostgreSQL") {
+    const sql = postgres({
+      host: conn.host!, port: conn.port || 5432, database: conn.database_name!, username: conn.username!,
+      password, ssl: conn.use_ssl ? "require" : false, max: 1, prepare: false, connect_timeout: 15,
+    });
+    return {
+      internal: false,
+      quote: (id) => id.split(".").map((p) => `"${p}"`).join("."),
+      async query(text, params = []) { return [...(await sql.unsafe(text, params as never[]))] as Record<string, unknown>[]; },
+      close: () => sql.end(),
+    };
+  }
+  if (t === "MySQL" || t === "MariaDB") {
+    const c = await mysql.createConnection({
+      host: conn.host!, port: conn.port || 3306, database: conn.database_name!, user: conn.username!, password,
+      ssl: conn.use_ssl ? { rejectUnauthorized: false } : undefined, connectTimeout: 15000,
+    });
+    return {
+      internal: false,
+      quote: (id) => id.split(".").map((p) => `\`${p}\``).join("."),
+      async query(text, params = []) {
+        const [rows] = await c.query(text, params);
+        return Array.isArray(rows) ? (rows as Record<string, unknown>[]) : [{ affected_rows: (rows as any).affectedRows }];
+      },
+      close: () => c.end(),
+    };
+  }
+  throw new Error(
+    `${t} servers on the bank's internal network can't be reached from the cloud yet. A secure gateway (VPN or tunnel) is needed — use PostgreSQL/MySQL or the Data Hub Staging database for now.`,
+  );
+}
+
+async function getConn(id: string): Promise<Conn> {
+  const { data, error } = await admin.from("db_connections").select("*").eq("id", id).maybeSingle();
+  if (error || !data) throw new Error("Connection not found");
+  return data as Conn;
+}
+
+async function withDriver<T>(id: string, fn: (d: Driver, c: Conn) => Promise<T>) {
+  const c = await getConn(id);
+  const d = await openDriver(c);
+  try { return await fn(d, c); } finally { await d.close().catch(() => {}); }
+}
+
+async function listTables(d: Driver, c: Conn) {
+  if (d.internal)
+    return (await d.query("select table_name as name from information_schema.tables where table_schema='staging' order by 1")).map((r) => String(r.name));
+  if (c.db_type === "PostgreSQL")
+    return (await d.query("select table_schema||'.'||table_name as name from information_schema.tables where table_schema not in ('pg_catalog','information_schema') order by 1")).map((r) => String(r.name));
+  return (await d.query("select table_name as name from information_schema.tables where table_schema = database() order by 1")).map((r) => String(r.name ?? (r as any).NAME ?? (r as any).TABLE_NAME));
+}
+
+async function countRows(d: Driver, table: string, where?: string | null) {
+  const r = await d.query(`select count(*) as n from ${d.quote(table)}${where ? ` where ${where}` : ""}`);
+  return Number(Object.values(r[0])[0]);
+}
+
+async function ensureTable(d: Driver, table: string, cols: string[], replace: boolean) {
+  const q = d.quote(table);
+  if (replace) await d.query(`drop table if exists ${q}`);
+  await d.query(`create table if not exists ${q} (${cols.map((c) => `${d.quote(c)} text`).join(", ")})`);
+}
+
+async function insertRows(d: Driver, table: string, cols: string[], rows: unknown[][]) {
+  const q = d.quote(table);
+  const colList = cols.map((c) => d.quote(c)).join(", ");
+  const batch = Math.max(1, Math.floor(1000 / Math.max(cols.length, 1)));
+  let n = 0;
+  for (let i = 0; i < rows.length; i += batch) {
+    const chunk = rows.slice(i, i + batch);
+    const params: unknown[] = [];
+    const values = chunk.map((row) => {
+      const ph = cols.map((_, j) => {
+        const v = row[j];
+        params.push(v === null || v === undefined || v === "" ? null : String(v));
+        return d.internal || !d.quote("x").startsWith("`") ? `$${params.length}` : "?";
+      });
+      return `(${ph.join(", ")})`;
+    });
+    await d.query(`insert into ${q} (${colList}) values ${values.join(", ")}`, params);
+    n += chunk.length;
+  }
+  return n;
+}
+
+async function logJob(job: Record<string, unknown>) {
+  await admin.from("etl_jobs").insert({ ...job, finished_at: new Date().toISOString() });
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+  try {
+    const auth = req.headers.get("Authorization") ?? "";
+    const userClient = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_ANON_KEY")!, {
+      global: { headers: { Authorization: auth } },
+    });
+    const { data: { user } } = await userClient.auth.getUser();
+    if (!user) return json({ error: "Not signed in" }, 401);
+
+    const { data: roles } = await admin.from("user_roles").select("role").eq("user_id", user.id);
+    const isPower = (roles ?? []).some((r) => r.role === "admin" || r.role === "analyst");
+    const body = await req.json();
+    const { action } = body;
+
+    const needPower = () => { if (!isPower) throw new Error("Only analysts and admins can run this. Ask an admin to upgrade your role."); };
+
+    switch (action) {
+      case "save_connection": {
+        const { name, db_type, host, port, database_name, username, password, use_ssl } = body;
+        if (!name || !db_type || !host || !database_name || !username) throw new Error("Fill in name, host, database and username.");
+        const { data, error } = await admin.from("db_connections").insert({
+          name: String(name).slice(0, 100), db_type, host, port: port ? Number(port) : null, database_name, username,
+          use_ssl: !!use_ssl, created_by: user.id,
+        }).select().single();
+        if (error) throw error;
+        await admin.from("db_connection_secrets").insert({ connection_id: data.id, password: password ?? "" });
+        return json({ connection: data });
+      }
+      case "test": {
+        const c = await getConn(body.connection_id);
+        let status = "connected", message = "Connection OK";
+        try {
+          const d = await openDriver(c);
+          try { await d.query("select 1 as ok"); } finally { await d.close().catch(() => {}); }
+        } catch (e) { status = "error"; message = (e as Error).message; }
+        await admin.from("db_connections").update({ status, status_message: message, last_tested_at: new Date().toISOString() }).eq("id", c.id);
+        return json({ status, message });
+      }
+      case "list_tables":
+        return json({ tables: await withDriver(body.connection_id, listTables) });
+      case "columns": {
+        const t = checkIdent(body.table);
+        const rows = await withDriver(body.connection_id, (d) => d.query(`select * from ${d.quote(t)} limit 1`));
+        return json({ columns: rows[0] ? Object.keys(rows[0]) : [] });
+      }
+      case "query": {
+        needPower();
+        const sql = String(body.sql ?? "").trim().replace(/;\s*$/, "");
+        if (!sql) throw new Error("Query is empty");
+        const started = Date.now();
+        const rows = await withDriver(body.connection_id, (d) => d.query(sql));
+        const out = rows.slice(0, MAX_ROWS).map((r) =>
+          Object.fromEntries(Object.entries(r).map(([k, v]) => [k, typeof v === "bigint" ? v.toString() : v])),
+        );
+        await logJob({ job_type: "query", title: sql.slice(0, 200), connection_id: body.connection_id, status: "success", dest_count: rows.length, created_by: user.id });
+        return json({ rows: out, total: rows.length, truncated: rows.length > MAX_ROWS, ms: Date.now() - started });
+      }
+      case "ingest_chunk": {
+        needPower();
+        const table = checkIdent(body.table);
+        const cols: string[] = (body.columns as string[]).map(cleanCol);
+        const inserted = await withDriver(body.connection_id, async (d) => {
+          if (body.first) await ensureTable(d, table, cols, body.mode === "replace");
+          return insertRows(d, table, cols, body.rows);
+        });
+        return json({ inserted });
+      }
+      case "ingest_finalize": {
+        needPower();
+        const table = checkIdent(body.table);
+        const destCount = await withDriver(body.connection_id, (d) => countRows(d, table));
+        const expected = Number(body.source_count) + Number(body.pre_count ?? 0);
+        const ok = destCount === expected;
+        await logJob({
+          job_type: "ingestion", title: body.file_name, connection_id: body.connection_id, target: table,
+          status: ok ? "success" : "mismatch", source_count: body.source_count, dest_count: destCount - Number(body.pre_count ?? 0),
+          message: ok ? "Row counts match" : `Expected ${expected} rows in table, found ${destCount}`, created_by: user.id,
+        });
+        return json({ dest_count: destCount, ok });
+      }
+      case "count": {
+        const table = checkIdent(body.table);
+        try { return json({ count: await withDriver(body.connection_id, (d) => countRows(d, table)) }); }
+        catch { return json({ count: 0 }); }
+      }
+      case "run_mapping": {
+        needPower();
+        const { data: m } = await admin.from("table_mappings").select("*").eq("id", body.mapping_id).single();
+        if (!m) throw new Error("Mapping not found");
+        const src = checkIdent(m.source_table), dst = checkIdent(m.dest_table);
+        const colsReq = m.source_columns.trim() === "*" ? null : m.source_columns.split(",").map((s: string) => checkIdent(s.trim()));
+        const where = m.where_clause?.trim() || null;
+        if (where) guardSql(where);
+        await admin.from("table_mappings").update({ status: "running" }).eq("id", m.id);
+        try {
+          const { rows, srcCount } = await withDriver(m.source_connection_id, async (d) => {
+            const sel = colsReq ? colsReq.map((c: string) => d.quote(c)).join(", ") : "*";
+            const rows = await d.query(`select ${sel} from ${d.quote(src)}${where ? ` where ${where}` : ""}`);
+            return { rows, srcCount: await countRows(d, src, where) };
+          });
+          const cols = rows[0] ? Object.keys(rows[0]).map(cleanCol) : (colsReq ?? []).map(cleanCol);
+          const { before, after } = await withDriver(m.dest_connection_id, async (d) => {
+            await ensureTable(d, dst, cols, false);
+            const before = await countRows(d, dst);
+            await insertRows(d, dst, cols, rows.map((r) => Object.values(r).map((v) => (v instanceof Date ? v.toISOString() : typeof v === "object" && v !== null ? JSON.stringify(v) : v))));
+            return { before, after: await countRows(d, dst) };
+          });
+          const loaded = after - before;
+          const ok = loaded === srcCount;
+          const msg = ok ? `Validated: ${srcCount} source rows = ${loaded} loaded` : `Mismatch: ${srcCount} source vs ${loaded} loaded`;
+          await admin.from("table_mappings").update({ status: ok ? "success" : "mismatch", last_source_count: srcCount, last_dest_count: loaded, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
+          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: ok ? "success" : "mismatch", source_count: srcCount, dest_count: loaded, message: msg, created_by: user.id });
+          return json({ ok, source_count: srcCount, dest_count: loaded, message: msg });
+        } catch (e) {
+          const msg = (e as Error).message;
+          await admin.from("table_mappings").update({ status: "error", last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
+          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, status: "error", message: msg, created_by: user.id });
+          throw e;
+        }
+      }
+      default:
+        return json({ error: "Unknown action" }, 400);
+    }
+  } catch (e) {
+    console.error(e);
+    return json({ error: (e as Error).message }, 400);
+  }
+});

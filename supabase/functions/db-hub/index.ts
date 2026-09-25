@@ -350,6 +350,8 @@ Deno.serve(async (req) => {
           job_type: "ingestion", title: body.file_name, connection_id: body.connection_id, target: table,
           status: ok ? "success" : "mismatch", source_count: body.source_count, dest_count: destCount - Number(body.pre_count ?? 0),
           message: ok ? "Row counts match" : `Expected ${expected} rows in table, found ${destCount}`, created_by: user.id,
+          started_at: body.started_at ?? null, duration_ms: body.started_at ? Date.now() - Date.parse(body.started_at) : null,
+          details: { mode: body.mode, pre_count: body.pre_count ?? 0, columns: body.columns ?? [], quality: body.quality ?? null },
         });
         return json({ dest_count: destCount, ok });
       }
@@ -366,6 +368,9 @@ Deno.serve(async (req) => {
         const colsReq = m.source_columns.trim() === "*" ? null : m.source_columns.split(",").map((s: string) => checkIdent(s.trim()));
         const where = m.where_clause?.trim() || null;
         if (where) guardSql(where);
+        const started = Date.now(), startedAt = new Date().toISOString();
+        const rules = (m.quality_rules ?? {}) as QualityRules;
+        const baseDetails = { source_table: src, dest_table: dst, columns: m.source_columns, filter: where, rules };
         await admin.from("table_mappings").update({ status: "running" }).eq("id", m.id);
         try {
           const { rows, srcCount } = await withDriver(m.source_connection_id, async (d) => {
@@ -373,23 +378,32 @@ Deno.serve(async (req) => {
             const rows = await d.query(`select ${sel} from ${d.quote(src)}${where ? ` where ${where}` : ""}`);
             return { rows, srcCount: await countRows(d, src, where) };
           });
-          const cols = rows[0] ? Object.keys(rows[0]).map(cleanCol) : (colsReq ?? []).map(cleanCol);
+          const rawCols = rows[0] ? Object.keys(rows[0]) : colsReq ?? [];
+          const cells = rows.map((r) => Object.values(r).map(toCell));
+          const quality = hasRules(rules) ? runQuality(rawCols, cells, rules) : null;
+          if (quality && !quality.passed && rules.block_on_fail) {
+            const msg = `Blocked by data quality rules: ${quality.issues.reduce((a, i) => a + i.count, 0)} issue(s) found. Nothing was loaded.`;
+            await admin.from("table_mappings").update({ status: "error", last_source_count: srcCount, last_dest_count: 0, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
+            await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: "blocked", source_count: srcCount, dest_count: 0, message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: { ...baseDetails, quality }, created_by: user.id });
+            return json({ ok: false, blocked: true, message: msg, quality });
+          }
+          const cols = rawCols.map(cleanCol);
           const { before, after } = await withDriver(m.dest_connection_id, async (d) => {
             await ensureTable(d, dst, cols, false);
             const before = await countRows(d, dst);
-            await insertRows(d, dst, cols, rows.map((r) => Object.values(r).map((v) => (v instanceof Date ? v.toISOString() : typeof v === "object" && v !== null ? JSON.stringify(v) : v))));
+            await insertRows(d, dst, cols, cells);
             return { before, after: await countRows(d, dst) };
           });
           const loaded = after - before;
           const ok = loaded === srcCount;
           const msg = ok ? `Validated: ${srcCount} source rows = ${loaded} loaded` : `Mismatch: ${srcCount} source vs ${loaded} loaded`;
           await admin.from("table_mappings").update({ status: ok ? "success" : "mismatch", last_source_count: srcCount, last_dest_count: loaded, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
-          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: ok ? "success" : "mismatch", source_count: srcCount, dest_count: loaded, message: msg, created_by: user.id });
-          return json({ ok, source_count: srcCount, dest_count: loaded, message: msg });
+          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: ok ? "success" : "mismatch", source_count: srcCount, dest_count: loaded, message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: { ...baseDetails, quality, dest_before: before, dest_after: after }, created_by: user.id });
+          return json({ ok, source_count: srcCount, dest_count: loaded, message: msg, quality });
         } catch (e) {
           const msg = (e as Error).message;
           await admin.from("table_mappings").update({ status: "error", last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
-          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, status: "error", message: msg, created_by: user.id });
+          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: "error", message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: baseDetails, created_by: user.id });
           throw e;
         }
       }

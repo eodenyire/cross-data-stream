@@ -1,6 +1,7 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import postgres from "npm:postgres@3.4.4";
 import mysql from "npm:mysql2@3.11.0/promise";
+import { hasRules, runQuality, type QualityRules } from "../_shared/dq.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -287,12 +288,47 @@ Deno.serve(async (req) => {
         const sql = String(body.sql ?? "").trim().replace(/;\s*$/, "");
         if (!sql) throw new Error("Query is empty");
         const started = Date.now();
-        const rows = await withDriver(body.connection_id, (d) => d.query(sql));
-        const out = rows.slice(0, MAX_ROWS).map((r) =>
-          Object.fromEntries(Object.entries(r).map(([k, v]) => [k, typeof v === "bigint" ? v.toString() : v])),
-        );
-        await logJob({ job_type: "query", title: sql.slice(0, 200), connection_id: body.connection_id, status: "success", dest_count: rows.length, created_by: user.id });
-        return json({ rows: out, total: rows.length, truncated: rows.length > MAX_ROWS, ms: Date.now() - started });
+        const startedAt = new Date().toISOString();
+        let rows: Record<string, unknown>[];
+        try {
+          rows = await withDriver(body.connection_id, (d) => d.query(sql));
+        } catch (e) {
+          await logJob({ job_type: "query", title: sql.slice(0, 200), connection_id: body.connection_id, status: "error", message: (e as Error).message, started_at: startedAt, duration_ms: Date.now() - started, details: { sql, ai_generated: !!body.ai_generated }, created_by: user.id });
+          throw e;
+        }
+        const out = rows.slice(0, MAX_ROWS).map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, toCell(v)])));
+        const ms = Date.now() - started;
+        await logJob({ job_type: "query", title: sql.slice(0, 200), connection_id: body.connection_id, status: "success", dest_count: rows.length, started_at: startedAt, duration_ms: ms, details: { sql, ai_generated: !!body.ai_generated, columns: out[0] ? Object.keys(out[0]) : [] }, created_by: user.id });
+        return json({ rows: out, total: rows.length, truncated: rows.length > MAX_ROWS, ms });
+      }
+      case "ai_sql": {
+        needPower();
+        const question = String(body.question ?? "").trim().slice(0, 2000);
+        if (!question) throw new Error("Describe what you want to find out.");
+        const c = await getConn(body.connection_id);
+        const schema = await withDriver(c.id, describeSchema);
+        const dialect = c.is_internal || c.db_type === "PostgreSQL" ? "PostgreSQL" : "MySQL";
+        const system = `You are a careful SQL analyst at Wekeza Bank. Write ONE read-only ${dialect} query (SELECT or WITH ... SELECT only, no semicolons, no data changes) that answers the analyst's question using only the tables and columns listed. Use explicit JOINs when combining tables. Add LIMIT 1000 unless the question is an aggregate. Columns loaded from files are stored as text, so cast when doing maths or date comparisons. If the question cannot be answered from the schema, return an empty sql string and explain why. The explanation should be plain English for a business analyst (2-5 sentences). List any assumptions you made.\n\nSchema:\n${schema || "(no tables found)"}`;
+        const ans = await askModel(req, system, question);
+        const safe = !ans.sql || isReadOnly(ans.sql);
+        return json({ ...ans, sql: ans.sql.trim(), safe, warning: safe ? null : "The generated query was not read-only and has been blocked. Rephrase your question." });
+      }
+      case "log_job": {
+        await logJob({ ...body.job, created_by: user.id });
+        return json({ ok: true });
+      }
+      case "check_mapping": {
+        const { data: m } = await admin.from("table_mappings").select("*").eq("id", body.mapping_id).single();
+        if (!m) throw new Error("Mapping not found");
+        const src = checkIdent(m.source_table);
+        const colsReq = m.source_columns.trim() === "*" ? null : m.source_columns.split(",").map((s: string) => checkIdent(s.trim()));
+        const where = m.where_clause?.trim() || null;
+        if (where) guardSql(where);
+        const rows = await withDriver(m.source_connection_id, (d) =>
+          d.query(`select ${colsReq ? colsReq.map((x: string) => d.quote(x)).join(", ") : "*"} from ${d.quote(src)}${where ? ` where ${where}` : ""}`));
+        const cols = rows[0] ? Object.keys(rows[0]) : colsReq ?? [];
+        const report = runQuality(cols, rows.map((r) => Object.values(r).map(toCell)), (m.quality_rules ?? {}) as QualityRules);
+        return json({ report });
       }
       case "ingest_chunk": {
         needPower();

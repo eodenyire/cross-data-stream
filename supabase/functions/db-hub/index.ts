@@ -153,6 +153,89 @@ async function logJob(job: Record<string, unknown>) {
   await admin.from("etl_jobs").insert({ ...job, finished_at: new Date().toISOString() });
 }
 
+const toCell = (v: unknown) => (v instanceof Date ? v.toISOString() : typeof v === "object" && v !== null ? JSON.stringify(v) : typeof v === "bigint" ? v.toString() : v);
+
+async function describeSchema(d: Driver, c: Conn) {
+  const tables = (await listTables(d, c)).slice(0, 60);
+  const out: string[] = [];
+  for (const t of tables) {
+    if (!IDENT.test(t)) continue;
+    try {
+      const [schema, name] = t.includes(".") ? t.split(".") : [null, t];
+      const rows = d.internal
+        ? await d.query("select column_name, data_type from information_schema.columns where table_schema='staging' and table_name=$1 order by ordinal_position", [name])
+        : c.db_type === "PostgreSQL"
+          ? await d.query("select column_name, data_type from information_schema.columns where table_schema=$1 and table_name=$2 order by ordinal_position", [schema, name])
+          : await d.query("select column_name, data_type from information_schema.columns where table_schema=database() and table_name=? order by ordinal_position", [name]);
+      out.push(`${t}(${rows.map((r: any) => `${r.column_name ?? r.COLUMN_NAME} ${r.data_type ?? r.DATA_TYPE}`).join(", ")})`);
+    } catch { out.push(`${t}(?)`); }
+  }
+  return out.join("\n");
+}
+
+const RUN_ID = "X-Lovable-AIG-Run-ID";
+async function askModel(req: Request, system: string, user: string) {
+  const key = Deno.env.get("LOVABLE_API_KEY");
+  if (!key) throw new Error("AI is not configured for this app.");
+  const headers: Record<string, string> = { "Content-Type": "application/json", "Lovable-API-Key": key, "X-Lovable-AIG-SDK": "fetch" };
+  const rid = req.headers.get(RUN_ID);
+  if (rid) headers[RUN_ID] = rid;
+  const res = await fetch("https://ai.gateway.lovable.dev/v1/responses", {
+    method: "POST", headers, signal: req.signal,
+    body: JSON.stringify({
+      model: "openai/gpt-6-astra", stream: true, store: false,
+      reasoning: { effort: "medium", summary: "auto" }, include: ["reasoning.encrypted_content"],
+      input: [{ role: "system", content: system }, { role: "user", content: user }],
+      text: {
+        format: {
+          type: "json_schema", name: "sql_answer", strict: true,
+          schema: {
+            type: "object", additionalProperties: false, required: ["sql", "explanation", "assumptions"],
+            properties: { sql: { type: "string" }, explanation: { type: "string" }, assumptions: { type: "array", items: { type: "string" } } },
+          },
+        },
+      },
+    }),
+  });
+  if (!res.ok) {
+    let msg = `AI request failed (${res.status})`;
+    try { const j = await res.json(); msg = j?.error?.message ?? j?.message ?? msg; } catch { /* ignore */ }
+    if (res.status === 402) msg = "AI credits are used up. Add credits in workspace billing settings to keep using the assistant.";
+    if (res.status === 429) msg = "The AI assistant is busy. Please wait a moment and try again.";
+    const e = new Error(msg); (e as any).status = res.status; throw e;
+  }
+  const reader = res.body!.getReader();
+  const dec = new TextDecoder();
+  let buf = "", text = "", refusal = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      try {
+        const ev = JSON.parse(data);
+        if (ev.type === "response.output_text.delta") text += ev.delta;
+        else if (ev.type === "response.refusal.delta") refusal += ev.delta;
+        else if (ev.type === "response.failed" || ev.type === "error") throw new Error(ev.response?.error?.message ?? ev.message ?? "AI request failed");
+      } catch (e) { if (!(e instanceof SyntaxError)) throw e; }
+    }
+  }
+  if (!text) throw new Error(refusal || "The AI assistant declined to answer this request.");
+  return JSON.parse(text) as { sql: string; explanation: string; assumptions: string[] };
+}
+
+function isReadOnly(sql: string) {
+  const s = sql.trim().replace(/;\s*$/, "");
+  if (s.includes(";")) return false;
+  if (!/^(select|with)\b/i.test(s)) return false;
+  return !/\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|merge|call|exec|copy|into)\b/i.test(s.replace(/'[^']*'/g, ""));
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   try {

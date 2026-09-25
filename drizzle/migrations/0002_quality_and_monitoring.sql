@@ -1,0 +1,2 @@
+ALTER TABLE public.etl_jobs ADD COLUMN IF NOT EXISTS duration_ms integer, ADD COLUMN IF NOT EXISTS started_at timestamptz, ADD COLUMN IF NOT EXISTS details jsonb;
+ALTER TABLE public.table_mappings ADD COLUMN IF NOT EXISTS quality_rules jsonb NOT NULL DEFAULT '{}'::jsonb;

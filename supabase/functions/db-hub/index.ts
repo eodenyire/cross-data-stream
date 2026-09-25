@@ -1,6 +1,7 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import postgres from "npm:postgres@3.4.4";
 import mysql from "npm:mysql2@3.11.0/promise";
+import { hasRules, runQuality, type QualityRules } from "../_shared/dq.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -153,6 +154,89 @@ async function logJob(job: Record<string, unknown>) {
   await admin.from("etl_jobs").insert({ ...job, finished_at: new Date().toISOString() });
 }
 
+const toCell = (v: unknown) => (v instanceof Date ? v.toISOString() : typeof v === "object" && v !== null ? JSON.stringify(v) : typeof v === "bigint" ? v.toString() : v);
+
+async function describeSchema(d: Driver, c: Conn) {
+  const tables = (await listTables(d, c)).slice(0, 60);
+  const out: string[] = [];
+  for (const t of tables) {
+    if (!IDENT.test(t)) continue;
+    try {
+      const [schema, name] = t.includes(".") ? t.split(".") : [null, t];
+      const rows = d.internal
+        ? await d.query("select column_name, data_type from information_schema.columns where table_schema='staging' and table_name=$1 order by ordinal_position", [name])
+        : c.db_type === "PostgreSQL"
+          ? await d.query("select column_name, data_type from information_schema.columns where table_schema=$1 and table_name=$2 order by ordinal_position", [schema, name])
+          : await d.query("select column_name, data_type from information_schema.columns where table_schema=database() and table_name=? order by ordinal_position", [name]);
+      out.push(`${t}(${rows.map((r: any) => `${r.column_name ?? r.COLUMN_NAME} ${r.data_type ?? r.DATA_TYPE}`).join(", ")})`);
+    } catch { out.push(`${t}(?)`); }
+  }
+  return out.join("\n");
+}
+
+const RUN_ID = "X-Lovable-AIG-Run-ID";
+async function askModel(req: Request, system: string, user: string) {
+  const key = Deno.env.get("LOVABLE_API_KEY");
+  if (!key) throw new Error("AI is not configured for this app.");
+  const headers: Record<string, string> = { "Content-Type": "application/json", "Lovable-API-Key": key, "X-Lovable-AIG-SDK": "fetch" };
+  const rid = req.headers.get(RUN_ID);
+  if (rid) headers[RUN_ID] = rid;
+  const res = await fetch("https://ai.gateway.lovable.dev/v1/responses", {
+    method: "POST", headers, signal: req.signal,
+    body: JSON.stringify({
+      model: "openai/gpt-6-astra", stream: true, store: false,
+      reasoning: { effort: "medium", summary: "auto" }, include: ["reasoning.encrypted_content"],
+      input: [{ role: "system", content: system }, { role: "user", content: user }],
+      text: {
+        format: {
+          type: "json_schema", name: "sql_answer", strict: true,
+          schema: {
+            type: "object", additionalProperties: false, required: ["sql", "explanation", "assumptions"],
+            properties: { sql: { type: "string" }, explanation: { type: "string" }, assumptions: { type: "array", items: { type: "string" } } },
+          },
+        },
+      },
+    }),
+  });
+  if (!res.ok) {
+    let msg = `AI request failed (${res.status})`;
+    try { const j = await res.json(); msg = j?.error?.message ?? j?.message ?? msg; } catch { /* ignore */ }
+    if (res.status === 402) msg = "AI credits are used up. Add credits in workspace billing settings to keep using the assistant.";
+    if (res.status === 429) msg = "The AI assistant is busy. Please wait a moment and try again.";
+    const e = new Error(msg); (e as any).status = res.status; throw e;
+  }
+  const reader = res.body!.getReader();
+  const dec = new TextDecoder();
+  let buf = "", text = "", refusal = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      try {
+        const ev = JSON.parse(data);
+        if (ev.type === "response.output_text.delta") text += ev.delta;
+        else if (ev.type === "response.refusal.delta") refusal += ev.delta;
+        else if (ev.type === "response.failed" || ev.type === "error") throw new Error(ev.response?.error?.message ?? ev.message ?? "AI request failed");
+      } catch (e) { if (!(e instanceof SyntaxError)) throw e; }
+    }
+  }
+  if (!text) throw new Error(refusal || "The AI assistant declined to answer this request.");
+  return JSON.parse(text) as { sql: string; explanation: string; assumptions: string[] };
+}
+
+function isReadOnly(sql: string) {
+  const s = sql.trim().replace(/;\s*$/, "");
+  if (s.includes(";")) return false;
+  if (!/^(select|with)\b/i.test(s)) return false;
+  return !/\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|merge|call|exec|copy|into)\b/i.test(s.replace(/'[^']*'/g, ""));
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   try {
@@ -204,12 +288,49 @@ Deno.serve(async (req) => {
         const sql = String(body.sql ?? "").trim().replace(/;\s*$/, "");
         if (!sql) throw new Error("Query is empty");
         const started = Date.now();
-        const rows = await withDriver(body.connection_id, (d) => d.query(sql));
-        const out = rows.slice(0, MAX_ROWS).map((r) =>
-          Object.fromEntries(Object.entries(r).map(([k, v]) => [k, typeof v === "bigint" ? v.toString() : v])),
-        );
-        await logJob({ job_type: "query", title: sql.slice(0, 200), connection_id: body.connection_id, status: "success", dest_count: rows.length, created_by: user.id });
-        return json({ rows: out, total: rows.length, truncated: rows.length > MAX_ROWS, ms: Date.now() - started });
+        const startedAt = new Date().toISOString();
+        let rows: Record<string, unknown>[];
+        try {
+          rows = await withDriver(body.connection_id, (d) => d.query(sql));
+        } catch (e) {
+          await logJob({ job_type: "query", title: sql.slice(0, 200), connection_id: body.connection_id, status: "error", message: (e as Error).message, started_at: startedAt, duration_ms: Date.now() - started, details: { sql, ai_generated: !!body.ai_generated }, created_by: user.id });
+          throw e;
+        }
+        const out = rows.slice(0, MAX_ROWS).map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, toCell(v)])));
+        const ms = Date.now() - started;
+        await logJob({ job_type: "query", title: sql.slice(0, 200), connection_id: body.connection_id, status: "success", dest_count: rows.length, started_at: startedAt, duration_ms: ms, details: { sql, ai_generated: !!body.ai_generated, columns: out[0] ? Object.keys(out[0]) : [] }, created_by: user.id });
+        return json({ rows: out, total: rows.length, truncated: rows.length > MAX_ROWS, ms });
+      }
+      case "ai_sql": {
+        needPower();
+        const question = String(body.question ?? "").trim().slice(0, 2000);
+        if (!question) throw new Error("Describe what you want to find out.");
+        const c = await getConn(body.connection_id);
+        const schema = await withDriver(c.id, describeSchema);
+        const dialect = c.is_internal || c.db_type === "PostgreSQL" ? "PostgreSQL" : "MySQL";
+        const system = `You are a careful SQL analyst at Wekeza Bank. Write ONE read-only ${dialect} query (SELECT or WITH ... SELECT only, no semicolons, no data changes) that answers the analyst's question using only the tables and columns listed. Use explicit JOINs when combining tables. Add LIMIT 1000 unless the question is an aggregate. Columns loaded from files are stored as text, so cast when doing maths or date comparisons. If the question cannot be answered from the schema, return an empty sql string and explain why. The explanation should be plain English for a business analyst (2-5 sentences). List any assumptions you made.\n\nSchema:\n${schema || "(no tables found)"}`;
+        const ans = await askModel(req, system, question);
+        const safe = !ans.sql || isReadOnly(ans.sql);
+        return json({ ...ans, sql: ans.sql.trim(), safe, warning: safe ? null : "The generated query was not read-only and has been blocked. Rephrase your question." });
+      }
+      case "log_job": {
+        const j = body.job ?? {};
+        const pick = ["job_type", "title", "connection_id", "target", "status", "source_count", "dest_count", "message", "started_at", "duration_ms", "details"];
+        await logJob({ ...Object.fromEntries(pick.filter((k) => k in j).map((k) => [k, j[k]])), created_by: user.id });
+        return json({ ok: true });
+      }
+      case "check_mapping": {
+        const { data: m } = await admin.from("table_mappings").select("*").eq("id", body.mapping_id).single();
+        if (!m) throw new Error("Mapping not found");
+        const src = checkIdent(m.source_table);
+        const colsReq = m.source_columns.trim() === "*" ? null : m.source_columns.split(",").map((s: string) => checkIdent(s.trim()));
+        const where = m.where_clause?.trim() || null;
+        if (where) guardSql(where);
+        const rows = await withDriver(m.source_connection_id, (d) =>
+          d.query(`select ${colsReq ? colsReq.map((x: string) => d.quote(x)).join(", ") : "*"} from ${d.quote(src)}${where ? ` where ${where}` : ""}`));
+        const cols = rows[0] ? Object.keys(rows[0]) : colsReq ?? [];
+        const report = runQuality(cols, rows.map((r) => Object.values(r).map(toCell)), (m.quality_rules ?? {}) as QualityRules);
+        return json({ report });
       }
       case "ingest_chunk": {
         needPower();
@@ -231,6 +352,8 @@ Deno.serve(async (req) => {
           job_type: "ingestion", title: body.file_name, connection_id: body.connection_id, target: table,
           status: ok ? "success" : "mismatch", source_count: body.source_count, dest_count: destCount - Number(body.pre_count ?? 0),
           message: ok ? "Row counts match" : `Expected ${expected} rows in table, found ${destCount}`, created_by: user.id,
+          started_at: body.started_at ?? null, duration_ms: body.started_at ? Date.now() - Date.parse(body.started_at) : null,
+          details: { mode: body.mode, pre_count: body.pre_count ?? 0, columns: body.columns ?? [], quality: body.quality ?? null },
         });
         return json({ dest_count: destCount, ok });
       }
@@ -247,6 +370,9 @@ Deno.serve(async (req) => {
         const colsReq = m.source_columns.trim() === "*" ? null : m.source_columns.split(",").map((s: string) => checkIdent(s.trim()));
         const where = m.where_clause?.trim() || null;
         if (where) guardSql(where);
+        const started = Date.now(), startedAt = new Date().toISOString();
+        const rules = (m.quality_rules ?? {}) as QualityRules;
+        const baseDetails = { source_table: src, dest_table: dst, columns: m.source_columns, filter: where, rules };
         await admin.from("table_mappings").update({ status: "running" }).eq("id", m.id);
         try {
           const { rows, srcCount } = await withDriver(m.source_connection_id, async (d) => {
@@ -254,23 +380,32 @@ Deno.serve(async (req) => {
             const rows = await d.query(`select ${sel} from ${d.quote(src)}${where ? ` where ${where}` : ""}`);
             return { rows, srcCount: await countRows(d, src, where) };
           });
-          const cols = rows[0] ? Object.keys(rows[0]).map(cleanCol) : (colsReq ?? []).map(cleanCol);
+          const rawCols = rows[0] ? Object.keys(rows[0]) : colsReq ?? [];
+          const cells = rows.map((r) => Object.values(r).map(toCell));
+          const quality = hasRules(rules) ? runQuality(rawCols, cells, rules) : null;
+          if (quality && !quality.passed && rules.block_on_fail) {
+            const msg = `Blocked by data quality rules: ${quality.issues.reduce((a, i) => a + i.count, 0)} issue(s) found. Nothing was loaded.`;
+            await admin.from("table_mappings").update({ status: "error", last_source_count: srcCount, last_dest_count: 0, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
+            await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: "blocked", source_count: srcCount, dest_count: 0, message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: { ...baseDetails, quality }, created_by: user.id });
+            return json({ ok: false, blocked: true, message: msg, quality });
+          }
+          const cols = rawCols.map(cleanCol);
           const { before, after } = await withDriver(m.dest_connection_id, async (d) => {
             await ensureTable(d, dst, cols, false);
             const before = await countRows(d, dst);
-            await insertRows(d, dst, cols, rows.map((r) => Object.values(r).map((v) => (v instanceof Date ? v.toISOString() : typeof v === "object" && v !== null ? JSON.stringify(v) : v))));
+            await insertRows(d, dst, cols, cells);
             return { before, after: await countRows(d, dst) };
           });
           const loaded = after - before;
           const ok = loaded === srcCount;
           const msg = ok ? `Validated: ${srcCount} source rows = ${loaded} loaded` : `Mismatch: ${srcCount} source vs ${loaded} loaded`;
           await admin.from("table_mappings").update({ status: ok ? "success" : "mismatch", last_source_count: srcCount, last_dest_count: loaded, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
-          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: ok ? "success" : "mismatch", source_count: srcCount, dest_count: loaded, message: msg, created_by: user.id });
-          return json({ ok, source_count: srcCount, dest_count: loaded, message: msg });
+          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: ok ? "success" : "mismatch", source_count: srcCount, dest_count: loaded, message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: { ...baseDetails, quality, dest_before: before, dest_after: after }, created_by: user.id });
+          return json({ ok, source_count: srcCount, dest_count: loaded, message: msg, quality });
         } catch (e) {
           const msg = (e as Error).message;
           await admin.from("table_mappings").update({ status: "error", last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
-          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, status: "error", message: msg, created_by: user.id });
+          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: "error", message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: baseDetails, created_by: user.id });
           throw e;
         }
       }

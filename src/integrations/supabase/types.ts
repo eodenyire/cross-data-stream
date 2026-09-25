@@ -94,11 +94,14 @@ export type Database = {
           created_at: string
           created_by: string | null
           dest_count: number | null
+          details: Json | null
+          duration_ms: number | null
           finished_at: string | null
           id: string
           job_type: string
           message: string | null
           source_count: number | null
+          started_at: string | null
           status: string
           target: string | null
           title: string
@@ -108,11 +111,14 @@ export type Database = {
           created_at?: string
           created_by?: string | null
           dest_count?: number | null
+          details?: Json | null
+          duration_ms?: number | null
           finished_at?: string | null
           id?: string
           job_type: string
           message?: string | null
           source_count?: number | null
+          started_at?: string | null
           status?: string
           target?: string | null
           title: string
@@ -122,11 +128,14 @@ export type Database = {
           created_at?: string
           created_by?: string | null
           dest_count?: number | null
+          details?: Json | null
+          duration_ms?: number | null
           finished_at?: string | null
           id?: string
           job_type?: string
           message?: string | null
           source_count?: number | null
+          started_at?: string | null
           status?: string
           target?: string | null
           title?: string
@@ -182,6 +191,7 @@ export type Database = {
           last_message: string | null
           last_run_at: string | null
           last_source_count: number | null
+          quality_rules: Json
           source_columns: string
           source_connection_id: string
           source_table: string
@@ -198,6 +208,7 @@ export type Database = {
           last_message?: string | null
           last_run_at?: string | null
           last_source_count?: number | null
+          quality_rules?: Json
           source_columns?: string
           source_connection_id: string
           source_table: string
@@ -214,6 +225,7 @@ export type Database = {
           last_message?: string | null
           last_run_at?: string | null
           last_source_count?: number | null
+          quality_rules?: Json
           source_columns?: string
           source_connection_id?: string
           source_table?: string

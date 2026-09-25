@@ -314,7 +314,9 @@ Deno.serve(async (req) => {
         return json({ ...ans, sql: ans.sql.trim(), safe, warning: safe ? null : "The generated query was not read-only and has been blocked. Rephrase your question." });
       }
       case "log_job": {
-        await logJob({ ...body.job, created_by: user.id });
+        const j = body.job ?? {};
+        const pick = ["job_type", "title", "connection_id", "target", "status", "source_count", "dest_count", "message", "started_at", "duration_ms", "details"];
+        await logJob({ ...Object.fromEntries(pick.filter((k) => k in j).map((k) => [k, j[k]])), created_by: user.id });
         return json({ ok: true });
       }
       case "check_mapping": {

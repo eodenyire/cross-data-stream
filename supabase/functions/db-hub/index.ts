@@ -150,8 +150,9 @@ async function insertRows(d: Driver, table: string, cols: string[], rows: unknow
   return n;
 }
 
-async function logJob(job: Record<string, unknown>) {
-  await admin.from("etl_jobs").insert({ ...job, finished_at: new Date().toISOString() });
+async function logJob(job: Record<string, unknown>): Promise<string | null> {
+  const { data } = await admin.from("etl_jobs").insert({ ...job, finished_at: new Date().toISOString() }).select("id").single();
+  return data?.id ?? null;
 }
 
 const toCell = (v: unknown) => (v instanceof Date ? v.toISOString() : typeof v === "object" && v !== null ? JSON.stringify(v) : typeof v === "bigint" ? v.toString() : v);
@@ -175,7 +176,14 @@ async function describeSchema(d: Driver, c: Conn) {
 }
 
 const RUN_ID = "X-Lovable-AIG-Run-ID";
-async function askModel(req: Request, system: string, user: string) {
+const SQL_FORMAT = {
+  name: "sql_answer",
+  schema: {
+    type: "object", additionalProperties: false, required: ["sql", "explanation", "assumptions"],
+    properties: { sql: { type: "string" }, explanation: { type: "string" }, assumptions: { type: "array", items: { type: "string" } } },
+  },
+};
+async function askModel<T = any>(req: Request, system: string, user: string, format: { name: string; schema: unknown } = SQL_FORMAT): Promise<T> {
   const key = Deno.env.get("LOVABLE_API_KEY");
   if (!key) throw new Error("AI is not configured for this app.");
   const headers: Record<string, string> = { "Content-Type": "application/json", "Lovable-API-Key": key, "X-Lovable-AIG-SDK": "fetch" };
@@ -187,15 +195,7 @@ async function askModel(req: Request, system: string, user: string) {
       model: "openai/gpt-6-astra", stream: true, store: false,
       reasoning: { effort: "medium", summary: "auto" }, include: ["reasoning.encrypted_content"],
       input: [{ role: "system", content: system }, { role: "user", content: user }],
-      text: {
-        format: {
-          type: "json_schema", name: "sql_answer", strict: true,
-          schema: {
-            type: "object", additionalProperties: false, required: ["sql", "explanation", "assumptions"],
-            properties: { sql: { type: "string" }, explanation: { type: "string" }, assumptions: { type: "array", items: { type: "string" } } },
-          },
-        },
-      },
+      text: { format: { type: "json_schema", name: format.name, strict: true, schema: format.schema } },
     }),
   });
   if (!res.ok) {
@@ -227,8 +227,55 @@ async function askModel(req: Request, system: string, user: string) {
     }
   }
   if (!text) throw new Error(refusal || "The AI assistant declined to answer this request.");
-  return JSON.parse(text) as { sql: string; explanation: string; assumptions: string[] };
+  return JSON.parse(text) as T;
 }
+
+async function runMapping(mappingId: string, userId: string, scheduleId: string | null = null): Promise<any> {
+        const { data: m } = await admin.from("table_mappings").select("*").eq("id", mappingId).single();
+        if (!m) throw new Error("Mapping not found");
+        const src = checkIdent(m.source_table), dst = checkIdent(m.dest_table);
+        const colsReq = m.source_columns.trim() === "*" ? null : m.source_columns.split(",").map((s: string) => checkIdent(s.trim()));
+        const where = m.where_clause?.trim() || null;
+        if (where) guardSql(where);
+        const started = Date.now(), startedAt = new Date().toISOString();
+        const rules = (m.quality_rules ?? {}) as QualityRules;
+        const baseDetails = { source_table: src, dest_table: dst, columns: m.source_columns, filter: where, rules };
+        await admin.from("table_mappings").update({ status: "running" }).eq("id", m.id);
+        try {
+          const { rows, srcCount } = await withDriver(m.source_connection_id, async (d) => {
+            const sel = colsReq ? colsReq.map((c: string) => d.quote(c)).join(", ") : "*";
+            const rows = await d.query(`select ${sel} from ${d.quote(src)}${where ? ` where ${where}` : ""}`);
+            return { rows, srcCount: await countRows(d, src, where) };
+          });
+          const rawCols = rows[0] ? Object.keys(rows[0]) : colsReq ?? [];
+          const cells = rows.map((r) => Object.values(r).map(toCell));
+          const quality = hasRules(rules) ? runQuality(rawCols, cells, rules) : null;
+          if (quality && !quality.passed && rules.block_on_fail) {
+            const msg = `Blocked by data quality rules: ${quality.issues.reduce((a, i) => a + i.count, 0)} issue(s) found. Nothing was loaded.`;
+            await admin.from("table_mappings").update({ status: "error", last_source_count: srcCount, last_dest_count: 0, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
+            await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: "blocked", source_count: srcCount, dest_count: 0, message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: { ...baseDetails, quality }, created_by: userId, schedule_id: scheduleId });
+            return ({ ok: false, blocked: true, message: msg, quality });
+          }
+          const cols = rawCols.map(cleanCol);
+          const { before, after } = await withDriver(m.dest_connection_id, async (d) => {
+            await ensureTable(d, dst, cols, false);
+            const before = await countRows(d, dst);
+            await insertRows(d, dst, cols, cells);
+            return { before, after: await countRows(d, dst) };
+          });
+          const loaded = after - before;
+          const ok = loaded === srcCount;
+          const msg = ok ? `Validated: ${srcCount} source rows = ${loaded} loaded` : `Mismatch: ${srcCount} source vs ${loaded} loaded`;
+          await admin.from("table_mappings").update({ status: ok ? "success" : "mismatch", last_source_count: srcCount, last_dest_count: loaded, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
+          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: ok ? "success" : "mismatch", source_count: srcCount, dest_count: loaded, message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: { ...baseDetails, quality, dest_before: before, dest_after: after }, created_by: userId, schedule_id: scheduleId });
+          return ({ ok, source_count: srcCount, dest_count: loaded, message: msg, quality });
+        } catch (e) {
+          const msg = (e as Error).message;
+          await admin.from("table_mappings").update({ status: "error", last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
+          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: "error", message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: baseDetails, created_by: userId, schedule_id: scheduleId });
+          throw e;
+        }
+      }
 
 function isReadOnly(sql: string) {
   const s = sql.trim().replace(/;\s*$/, "");
@@ -309,7 +356,7 @@ Deno.serve(async (req) => {
         const schema = await withDriver(c.id, describeSchema);
         const dialect = c.is_internal || c.db_type === "PostgreSQL" ? "PostgreSQL" : "MySQL";
         const system = `You are a careful SQL analyst at Wekeza Bank. Write ONE read-only ${dialect} query (SELECT or WITH ... SELECT only, no semicolons, no data changes) that answers the analyst's question using only the tables and columns listed. Use explicit JOINs when combining tables. Add LIMIT 1000 unless the question is an aggregate. Columns loaded from files are stored as text, so cast when doing maths or date comparisons. If the question cannot be answered from the schema, return an empty sql string and explain why. The explanation should be plain English for a business analyst (2-5 sentences). List any assumptions you made.\n\nSchema:\n${schema || "(no tables found)"}`;
-        const ans = await askModel(req, system, question);
+        const ans = await askModel<{ sql: string; explanation: string; assumptions: string[] }>(req, system, question);
         const safe = !ans.sql || isReadOnly(ans.sql);
         return json({ ...ans, sql: ans.sql.trim(), safe, warning: safe ? null : "The generated query was not read-only and has been blocked. Rephrase your question." });
       }
@@ -364,50 +411,7 @@ Deno.serve(async (req) => {
       }
       case "run_mapping": {
         needPower();
-        const { data: m } = await admin.from("table_mappings").select("*").eq("id", body.mapping_id).single();
-        if (!m) throw new Error("Mapping not found");
-        const src = checkIdent(m.source_table), dst = checkIdent(m.dest_table);
-        const colsReq = m.source_columns.trim() === "*" ? null : m.source_columns.split(",").map((s: string) => checkIdent(s.trim()));
-        const where = m.where_clause?.trim() || null;
-        if (where) guardSql(where);
-        const started = Date.now(), startedAt = new Date().toISOString();
-        const rules = (m.quality_rules ?? {}) as QualityRules;
-        const baseDetails = { source_table: src, dest_table: dst, columns: m.source_columns, filter: where, rules };
-        await admin.from("table_mappings").update({ status: "running" }).eq("id", m.id);
-        try {
-          const { rows, srcCount } = await withDriver(m.source_connection_id, async (d) => {
-            const sel = colsReq ? colsReq.map((c: string) => d.quote(c)).join(", ") : "*";
-            const rows = await d.query(`select ${sel} from ${d.quote(src)}${where ? ` where ${where}` : ""}`);
-            return { rows, srcCount: await countRows(d, src, where) };
-          });
-          const rawCols = rows[0] ? Object.keys(rows[0]) : colsReq ?? [];
-          const cells = rows.map((r) => Object.values(r).map(toCell));
-          const quality = hasRules(rules) ? runQuality(rawCols, cells, rules) : null;
-          if (quality && !quality.passed && rules.block_on_fail) {
-            const msg = `Blocked by data quality rules: ${quality.issues.reduce((a, i) => a + i.count, 0)} issue(s) found. Nothing was loaded.`;
-            await admin.from("table_mappings").update({ status: "error", last_source_count: srcCount, last_dest_count: 0, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
-            await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: "blocked", source_count: srcCount, dest_count: 0, message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: { ...baseDetails, quality }, created_by: user.id });
-            return json({ ok: false, blocked: true, message: msg, quality });
-          }
-          const cols = rawCols.map(cleanCol);
-          const { before, after } = await withDriver(m.dest_connection_id, async (d) => {
-            await ensureTable(d, dst, cols, false);
-            const before = await countRows(d, dst);
-            await insertRows(d, dst, cols, cells);
-            return { before, after: await countRows(d, dst) };
-          });
-          const loaded = after - before;
-          const ok = loaded === srcCount;
-          const msg = ok ? `Validated: ${srcCount} source rows = ${loaded} loaded` : `Mismatch: ${srcCount} source vs ${loaded} loaded`;
-          await admin.from("table_mappings").update({ status: ok ? "success" : "mismatch", last_source_count: srcCount, last_dest_count: loaded, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
-          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: ok ? "success" : "mismatch", source_count: srcCount, dest_count: loaded, message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: { ...baseDetails, quality, dest_before: before, dest_after: after }, created_by: user.id });
-          return json({ ok, source_count: srcCount, dest_count: loaded, message: msg, quality });
-        } catch (e) {
-          const msg = (e as Error).message;
-          await admin.from("table_mappings").update({ status: "error", last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
-          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: "error", message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: baseDetails, created_by: user.id });
-          throw e;
-        }
+        return json(await runMapping(body.mapping_id, user.id));
       }
       default:
         return json({ error: "Unknown action" }, 400);

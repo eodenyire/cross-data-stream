@@ -1,6 +1,6 @@
 // Server-side file reading/writing for scheduled ingestion and conversion jobs.
 import * as XLSX from "npm:xlsx@0.18.5";
-import { parquetReadObjects } from "npm:hyparquet@1.25.1";
+import { parquetReadObjects } from "npm:hyparquet@1.31.2";
 import { parquetWriteBuffer } from "npm:hyparquet-writer@0.16.10";
 
 export type Table = { columns: string[]; rows: unknown[][] };

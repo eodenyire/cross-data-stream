@@ -2,6 +2,8 @@ import { createClient } from "npm:@supabase/supabase-js@2";
 import postgres from "npm:postgres@3.4.4";
 import mysql from "npm:mysql2@3.11.0/promise";
 import { hasRules, runQuality, type QualityRules } from "../_shared/dq.ts";
+import cronParser from "npm:cron-parser@4.9.0";
+import { OUTPUT_FORMATS, parseFile, selectColumns, writeFile, type OutputFormat } from "./files.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -150,8 +152,9 @@ async function insertRows(d: Driver, table: string, cols: string[], rows: unknow
   return n;
 }
 
-async function logJob(job: Record<string, unknown>) {
-  await admin.from("etl_jobs").insert({ ...job, finished_at: new Date().toISOString() });
+async function logJob(job: Record<string, unknown>): Promise<string | null> {
+  const { data } = await admin.from("etl_jobs").insert({ ...job, finished_at: new Date().toISOString() }).select("id").single();
+  return data?.id ?? null;
 }
 
 const toCell = (v: unknown) => (v instanceof Date ? v.toISOString() : typeof v === "object" && v !== null ? JSON.stringify(v) : typeof v === "bigint" ? v.toString() : v);
@@ -175,7 +178,14 @@ async function describeSchema(d: Driver, c: Conn) {
 }
 
 const RUN_ID = "X-Lovable-AIG-Run-ID";
-async function askModel(req: Request, system: string, user: string) {
+const SQL_FORMAT = {
+  name: "sql_answer",
+  schema: {
+    type: "object", additionalProperties: false, required: ["sql", "explanation", "assumptions"],
+    properties: { sql: { type: "string" }, explanation: { type: "string" }, assumptions: { type: "array", items: { type: "string" } } },
+  },
+};
+async function askModel<T = any>(req: Request, system: string, user: string, format: { name: string; schema: unknown } = SQL_FORMAT): Promise<T> {
   const key = Deno.env.get("LOVABLE_API_KEY");
   if (!key) throw new Error("AI is not configured for this app.");
   const headers: Record<string, string> = { "Content-Type": "application/json", "Lovable-API-Key": key, "X-Lovable-AIG-SDK": "fetch" };
@@ -187,15 +197,7 @@ async function askModel(req: Request, system: string, user: string) {
       model: "openai/gpt-6-astra", stream: true, store: false,
       reasoning: { effort: "medium", summary: "auto" }, include: ["reasoning.encrypted_content"],
       input: [{ role: "system", content: system }, { role: "user", content: user }],
-      text: {
-        format: {
-          type: "json_schema", name: "sql_answer", strict: true,
-          schema: {
-            type: "object", additionalProperties: false, required: ["sql", "explanation", "assumptions"],
-            properties: { sql: { type: "string" }, explanation: { type: "string" }, assumptions: { type: "array", items: { type: "string" } } },
-          },
-        },
-      },
+      text: { format: { type: "json_schema", name: format.name, strict: true, schema: format.schema } },
     }),
   });
   if (!res.ok) {
@@ -227,8 +229,219 @@ async function askModel(req: Request, system: string, user: string) {
     }
   }
   if (!text) throw new Error(refusal || "The AI assistant declined to answer this request.");
-  return JSON.parse(text) as { sql: string; explanation: string; assumptions: string[] };
+  return JSON.parse(text) as T;
 }
+
+async function runMapping(mappingId: string, userId: string, scheduleId: string | null = null): Promise<any> {
+        const { data: m } = await admin.from("table_mappings").select("*").eq("id", mappingId).single();
+        if (!m) throw new Error("Mapping not found");
+        const src = checkIdent(m.source_table), dst = checkIdent(m.dest_table);
+        const colsReq = m.source_columns.trim() === "*" ? null : m.source_columns.split(",").map((s: string) => checkIdent(s.trim()));
+        const where = m.where_clause?.trim() || null;
+        if (where) guardSql(where);
+        const started = Date.now(), startedAt = new Date().toISOString();
+        const rules = (m.quality_rules ?? {}) as QualityRules;
+        const baseDetails = { source_table: src, dest_table: dst, columns: m.source_columns, filter: where, rules };
+        await admin.from("table_mappings").update({ status: "running" }).eq("id", m.id);
+        try {
+          const { rows, srcCount } = await withDriver(m.source_connection_id, async (d) => {
+            const sel = colsReq ? colsReq.map((c: string) => d.quote(c)).join(", ") : "*";
+            const rows = await d.query(`select ${sel} from ${d.quote(src)}${where ? ` where ${where}` : ""}`);
+            return { rows, srcCount: await countRows(d, src, where) };
+          });
+          const rawCols = rows[0] ? Object.keys(rows[0]) : colsReq ?? [];
+          const cells = rows.map((r) => Object.values(r).map(toCell));
+          const quality = hasRules(rules) ? runQuality(rawCols, cells, rules) : null;
+          if (quality && !quality.passed && rules.block_on_fail) {
+            const msg = `Blocked by data quality rules: ${quality.issues.reduce((a, i) => a + i.count, 0)} issue(s) found. Nothing was loaded.`;
+            await admin.from("table_mappings").update({ status: "error", last_source_count: srcCount, last_dest_count: 0, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
+            await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: "blocked", source_count: srcCount, dest_count: 0, message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: { ...baseDetails, quality }, created_by: userId, schedule_id: scheduleId });
+            return ({ ok: false, blocked: true, message: msg, quality });
+          }
+          const cols = rawCols.map(cleanCol);
+          const { before, after } = await withDriver(m.dest_connection_id, async (d) => {
+            await ensureTable(d, dst, cols, false);
+            const before = await countRows(d, dst);
+            await insertRows(d, dst, cols, cells);
+            return { before, after: await countRows(d, dst) };
+          });
+          const loaded = after - before;
+          const ok = loaded === srcCount;
+          const msg = ok ? `Validated: ${srcCount} source rows = ${loaded} loaded` : `Mismatch: ${srcCount} source vs ${loaded} loaded`;
+          await admin.from("table_mappings").update({ status: ok ? "success" : "mismatch", last_source_count: srcCount, last_dest_count: loaded, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
+          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: ok ? "success" : "mismatch", source_count: srcCount, dest_count: loaded, message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: { ...baseDetails, quality, dest_before: before, dest_after: after }, created_by: userId, schedule_id: scheduleId });
+          return ({ ok, source_count: srcCount, dest_count: loaded, message: msg, quality });
+        } catch (e) {
+          const msg = (e as Error).message;
+          await admin.from("table_mappings").update({ status: "error", last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
+          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: "error", message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: baseDetails, created_by: userId, schedule_id: scheduleId });
+          throw e;
+        }
+      }
+
+// ---------- Scheduled jobs ----------
+const BUCKET = "datahub-files";
+const MAX_FILE = 50 * 1024 * 1024;
+
+function nextRun(cron: string, tz: string) {
+  return cronParser.parseExpression(cron, { tz, currentDate: new Date() }).next().toDate().toISOString();
+}
+function cleanFolder(f: unknown) {
+  return String(f ?? "").trim().replace(/^\/+|\/+$/g, "").replace(/\.\./g, "");
+}
+
+async function fetchSource(cfg: any): Promise<{ name: string; bytes: Uint8Array }> {
+  if (cfg.source === "url") {
+    const url = new URL(String(cfg.url ?? ""));
+    if (url.protocol !== "https:") throw new Error("File links must start with https://");
+    const res = await fetch(url, { redirect: "follow" });
+    if (!res.ok) throw new Error(`Could not download the file (${res.status})`);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.byteLength > MAX_FILE) throw new Error("File is larger than 50 MB");
+    const name = decodeURIComponent(url.pathname.split("/").pop() || "download.csv");
+    return { name, bytes };
+  }
+  const folder = cleanFolder(cfg.folder);
+  const { data, error } = await admin.storage.from(BUCKET).list(folder, { limit: 200, sortBy: { column: "created_at", order: "desc" } });
+  if (error) throw new Error(error.message);
+  const match = String(cfg.match ?? "").trim().toLowerCase();
+  const file = (data ?? []).find((f) => f.id && !f.name.startsWith(".") && (!match || f.name.toLowerCase().includes(match)));
+  if (!file) throw new Error(`No file found in folder "${folder || "/"}"${match ? ` containing "${match}"` : ""}`);
+  const path = folder ? `${folder}/${file.name}` : file.name;
+  const { data: blob, error: dErr } = await admin.storage.from(BUCKET).download(path);
+  if (dErr || !blob) throw new Error(dErr?.message ?? "Download failed");
+  return { name: path, bytes: new Uint8Array(await blob.arrayBuffer()) };
+}
+
+async function runIngestion(cfg: any, userId: string, scheduleId: string | null) {
+  const started = Date.now(), startedAt = new Date().toISOString();
+  const table = checkIdent(String(cfg.table ?? ""));
+  const mode = cfg.mode === "append" ? "append" : "replace";
+  const rules = (cfg.rules ?? {}) as QualityRules;
+  let fileName = "";
+  try {
+    const src = await fetchSource(cfg);
+    fileName = src.name;
+    const { columns, rows } = await parseFile(src.name, src.bytes, cfg.sheet || null);
+    if (!columns.length) throw new Error("File has no header row");
+    const quality = hasRules(rules) ? runQuality(columns, rows, rules) : null;
+    if (quality && !quality.passed && rules.block_on_fail) {
+      const message = "Blocked by data quality rules. Nothing was loaded.";
+      const jobId = await logJob({ job_type: "ingestion", title: fileName, connection_id: cfg.connection_id, target: table, status: "blocked", source_count: rows.length, dest_count: 0, message, started_at: startedAt, duration_ms: Date.now() - started, details: { mode, columns, quality, scheduled: true }, created_by: userId, schedule_id: scheduleId });
+      return { status: "blocked", message, jobId };
+    }
+    const cols = columns.map(cleanCol);
+    const { pre, after } = await withDriver(cfg.connection_id, async (d) => {
+      let pre = 0;
+      if (mode === "append") { try { pre = await countRows(d, table); } catch { pre = 0; } }
+      await ensureTable(d, table, cols, mode === "replace");
+      await insertRows(d, table, cols, rows);
+      return { pre, after: await countRows(d, table) };
+    });
+    const loaded = after - pre, ok = loaded === rows.length;
+    const message = ok ? `Loaded ${loaded} rows, counts match` : `Expected ${rows.length} rows, table gained ${loaded}`;
+    const jobId = await logJob({ job_type: "ingestion", title: fileName, connection_id: cfg.connection_id, target: table, status: ok ? "success" : "mismatch", source_count: rows.length, dest_count: loaded, message, started_at: startedAt, duration_ms: Date.now() - started, details: { mode, pre_count: pre, columns, quality, scheduled: true }, created_by: userId, schedule_id: scheduleId });
+    return { status: ok ? "success" : "mismatch", message, jobId };
+  } catch (e) {
+    const message = (e as Error).message;
+    const jobId = await logJob({ job_type: "ingestion", title: fileName || "scheduled ingestion", connection_id: cfg.connection_id || null, target: table, status: "error", message, started_at: startedAt, duration_ms: Date.now() - started, details: { mode, scheduled: true, source: cfg.source, folder: cfg.folder, url: cfg.url }, created_by: userId, schedule_id: scheduleId });
+    return { status: "error", message, jobId };
+  }
+}
+
+async function runConversion(cfg: any, userId: string, scheduleId: string | null) {
+  const started = Date.now(), startedAt = new Date().toISOString();
+  let fileName = "";
+  try {
+    const format = String(cfg.format ?? "csv") as OutputFormat;
+    if (!OUTPUT_FORMATS.includes(format)) throw new Error(`Unsupported output format ${format}`);
+    const src = await fetchSource(cfg);
+    fileName = src.name;
+    const parsed = await parseFile(src.name, src.bytes, cfg.sheet || null);
+    const cols = Array.isArray(cfg.columns) ? cfg.columns.map(String).filter(Boolean) : [];
+    const t = selectColumns(parsed, cols);
+    const out = writeFile(format, t, cfg.sheet || "data");
+    const base = src.name.split("/").pop()!.replace(/\.[^.]+$/, "");
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
+    const outFolder = cleanFolder(cfg.output_folder) || "converted";
+    const outPath = `${outFolder}/${base}_${stamp}.${format}`;
+    const { error } = await admin.storage.from(BUCKET).upload(outPath, out.bytes, { contentType: out.type, upsert: true });
+    if (error) throw new Error(error.message);
+    const message = `Wrote ${t.rows.length} rows to ${outPath}`;
+    const jobId = await logJob({ job_type: "conversion", title: fileName, target: outPath, status: "success", source_count: parsed.rows.length, dest_count: t.rows.length, message, started_at: startedAt, duration_ms: Date.now() - started, details: { input_format: parsed.format, output_format: format, sheet: cfg.sheet || null, columns: t.columns, scheduled: true }, created_by: userId, schedule_id: scheduleId });
+    return { status: "success", message, jobId };
+  } catch (e) {
+    const message = (e as Error).message;
+    const jobId = await logJob({ job_type: "conversion", title: fileName || "scheduled conversion", status: "error", message, started_at: startedAt, duration_ms: Date.now() - started, details: { scheduled: true, source: cfg.source, folder: cfg.folder, url: cfg.url }, created_by: userId, schedule_id: scheduleId });
+    return { status: "error", message, jobId };
+  }
+}
+
+async function executeSchedule(s: any) {
+  let r: { status: string; message: string; jobId: string | null };
+  try {
+    if (s.job_type === "ingestion") r = await runIngestion(s.config, s.created_by, s.id);
+    else if (s.job_type === "conversion") r = await runConversion(s.config, s.created_by, s.id);
+    else {
+      try {
+        const m = await runMapping(String(s.config?.mapping_id ?? ""), s.created_by, s.id);
+        r = { status: m.blocked ? "blocked" : m.ok ? "success" : "mismatch", message: m.message, jobId: null };
+      } catch (e) { r = { status: "error", message: (e as Error).message, jobId: null }; }
+    }
+  } catch (e) { r = { status: "error", message: (e as Error).message, jobId: null }; }
+  let next: string | null = null;
+  try { next = nextRun(s.cron, s.timezone); } catch { /* keep null */ }
+  await admin.from("schedules").update({ last_run_at: new Date().toISOString(), last_status: r.status, last_message: r.message, next_run_at: next, lock_until: null }).eq("id", s.id);
+  if (r.status !== "success") {
+    await admin.from("notifications").insert({
+      title: `Scheduled job "${s.name}" ${r.status === "error" ? "failed" : r.status}`,
+      body: r.message, level: r.status === "error" ? "error" : "warning", schedule_id: s.id, job_id: r.jobId,
+    });
+  }
+  return r;
+}
+
+async function claim(id: string) {
+  const until = new Date(Date.now() + 15 * 60_000).toISOString();
+  const { data } = await admin.from("schedules").update({ lock_until: until }).eq("id", id)
+    .or(`lock_until.is.null,lock_until.lt.${new Date().toISOString()}`).select("*");
+  return data?.[0] ?? null;
+}
+
+async function tick() {
+  const now = new Date().toISOString();
+  const { data: due } = await admin.from("schedules").select("id").eq("enabled", true).lte("next_run_at", now).order("next_run_at").limit(3);
+  const results: unknown[] = [];
+  for (const d of due ?? []) {
+    const s = await claim(d.id);
+    if (!s) continue;
+    results.push({ id: s.id, ...(await executeSchedule(s)) });
+  }
+  return results;
+}
+
+const FIX_FORMAT = {
+  name: "dq_fixes",
+  schema: {
+    type: "object", additionalProperties: false, required: ["summary", "fixes", "overall_impact", "next_steps"],
+    properties: {
+      summary: { type: "string" },
+      fixes: {
+        type: "array",
+        items: {
+          type: "object", additionalProperties: false,
+          required: ["title", "problem", "fix", "example", "impact", "risk"],
+          properties: {
+            title: { type: "string" }, problem: { type: "string" }, fix: { type: "string" },
+            example: { type: "string" }, impact: { type: "string" }, risk: { type: "string" },
+          },
+        },
+      },
+      overall_impact: { type: "string" },
+      next_steps: { type: "array", items: { type: "string" } },
+    },
+  },
+};
 
 function isReadOnly(sql: string) {
   const s = sql.trim().replace(/;\s*$/, "");
@@ -240,6 +453,11 @@ function isReadOnly(sql: string) {
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   try {
+    const secret = Deno.env.get("SCHEDULER_SECRET");
+    if (req.headers.get("x-scheduler-secret")) {
+      if (!secret || req.headers.get("x-scheduler-secret") !== secret) return json({ error: "Forbidden" }, 403);
+      return json({ ran: await tick() });
+    }
     const auth = req.headers.get("Authorization") ?? "";
     const userClient = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_ANON_KEY")!, {
       global: { headers: { Authorization: auth } },
@@ -309,9 +527,58 @@ Deno.serve(async (req) => {
         const schema = await withDriver(c.id, describeSchema);
         const dialect = c.is_internal || c.db_type === "PostgreSQL" ? "PostgreSQL" : "MySQL";
         const system = `You are a careful SQL analyst at Wekeza Bank. Write ONE read-only ${dialect} query (SELECT or WITH ... SELECT only, no semicolons, no data changes) that answers the analyst's question using only the tables and columns listed. Use explicit JOINs when combining tables. Add LIMIT 1000 unless the question is an aggregate. Columns loaded from files are stored as text, so cast when doing maths or date comparisons. If the question cannot be answered from the schema, return an empty sql string and explain why. The explanation should be plain English for a business analyst (2-5 sentences). List any assumptions you made.\n\nSchema:\n${schema || "(no tables found)"}`;
-        const ans = await askModel(req, system, question);
+        const ans = await askModel<{ sql: string; explanation: string; assumptions: string[] }>(req, system, question);
         const safe = !ans.sql || isReadOnly(ans.sql);
         return json({ ...ans, sql: ans.sql.trim(), safe, warning: safe ? null : "The generated query was not read-only and has been blocked. Rephrase your question." });
+      }
+      case "save_schedule": {
+        needPower();
+        const b = body.schedule ?? {};
+        const name = String(b.name ?? "").trim().slice(0, 120);
+        if (!name) throw new Error("Give the schedule a name.");
+        if (!["ingestion", "mapping", "conversion"].includes(b.job_type)) throw new Error("Choose a job type.");
+        const cron = String(b.cron ?? "").trim();
+        const tz = String(b.timezone || "Africa/Nairobi");
+        let next: string;
+        try { next = nextRun(cron, tz); } catch { throw new Error("The repeat pattern is not valid."); }
+        const emails = (Array.isArray(b.notify_emails) ? b.notify_emails : []).map((e: unknown) => String(e).trim()).filter((e: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)).slice(0, 20);
+        const cfg = b.config ?? {};
+        if (b.job_type === "ingestion") { checkIdent(String(cfg.table ?? "")); if (!cfg.connection_id) throw new Error("Choose a target connection."); }
+        if (b.job_type === "mapping" && !cfg.mapping_id) throw new Error("Choose a table mapping.");
+        if (b.job_type !== "mapping" && cfg.source === "url" && !/^https:\/\//.test(String(cfg.url ?? ""))) throw new Error("File links must start with https://");
+        const row = { name, job_type: b.job_type, recurrence: b.recurrence ?? {}, cron, timezone: tz, config: cfg, enabled: b.enabled !== false, notify_emails: emails, next_run_at: next };
+        if (b.id) {
+          const { data: ex } = await admin.from("schedules").select("created_by").eq("id", b.id).single();
+          const isAdmin = (roles ?? []).some((r) => r.role === "admin");
+          if (!ex || (ex.created_by !== user.id && !isAdmin)) throw new Error("Only the owner or an admin can change this schedule.");
+          const { data, error } = await admin.from("schedules").update(row).eq("id", b.id).select().single();
+          if (error) throw error;
+          return json({ schedule: data });
+        }
+        const { data, error } = await admin.from("schedules").insert({ ...row, created_by: user.id }).select().single();
+        if (error) throw error;
+        return json({ schedule: data });
+      }
+      case "preview_cron": {
+        try {
+          const it = cronParser.parseExpression(String(body.cron ?? ""), { tz: String(body.timezone || "Africa/Nairobi") });
+          return json({ next: [0, 1, 2].map(() => it.next().toDate().toISOString()) });
+        } catch { return json({ next: [], invalid: true }); }
+      }
+      case "run_schedule": {
+        needPower();
+        const s = await claim(String(body.schedule_id ?? ""));
+        if (!s) throw new Error("This schedule is already running or doesn't exist.");
+        return json(await executeSchedule(s));
+      }
+      case "ai_fix": {
+        needPower();
+        const report = typeof body.report === "string" ? body.report : JSON.stringify(body.report ?? {}, null, 2);
+        if (!report.trim() || report === "{}") throw new Error("Provide the failed data quality report.");
+        const context = String(body.context ?? "").slice(0, 4000);
+        const system = `You are a senior data quality engineer at Wekeza Bank helping a risk data analyst fix a failed data quality check before data is loaded. Given the validation report (rules checked, failing columns, counts and example rows) and the analyst's remediation context, recommend specific, practical fixes, most important first (at most 6). For each fix give: a short title; the problem in plain English; the concrete fix (e.g. a cleaning step, a changed rule, a source-system correction, a SQL UPDATE/SELECT on the staging table, or an Excel step); a short example (SQL, formula or rule change — empty string if none); the likely impact on row counts, downstream reports and risk figures; and the risk of applying it (e.g. data loss, hiding real problems). Never recommend simply deleting failing rows or disabling rules without explaining what is lost. Be concise; this is read by business analysts.`;
+        const ans = await askModel(req, system, `Validation report:\n${report.slice(0, 12000)}\n\nRemediation context from the analyst:\n${context || "(none given)"}`, FIX_FORMAT);
+        return json(ans);
       }
       case "log_job": {
         const j = body.job ?? {};
@@ -364,50 +631,7 @@ Deno.serve(async (req) => {
       }
       case "run_mapping": {
         needPower();
-        const { data: m } = await admin.from("table_mappings").select("*").eq("id", body.mapping_id).single();
-        if (!m) throw new Error("Mapping not found");
-        const src = checkIdent(m.source_table), dst = checkIdent(m.dest_table);
-        const colsReq = m.source_columns.trim() === "*" ? null : m.source_columns.split(",").map((s: string) => checkIdent(s.trim()));
-        const where = m.where_clause?.trim() || null;
-        if (where) guardSql(where);
-        const started = Date.now(), startedAt = new Date().toISOString();
-        const rules = (m.quality_rules ?? {}) as QualityRules;
-        const baseDetails = { source_table: src, dest_table: dst, columns: m.source_columns, filter: where, rules };
-        await admin.from("table_mappings").update({ status: "running" }).eq("id", m.id);
-        try {
-          const { rows, srcCount } = await withDriver(m.source_connection_id, async (d) => {
-            const sel = colsReq ? colsReq.map((c: string) => d.quote(c)).join(", ") : "*";
-            const rows = await d.query(`select ${sel} from ${d.quote(src)}${where ? ` where ${where}` : ""}`);
-            return { rows, srcCount: await countRows(d, src, where) };
-          });
-          const rawCols = rows[0] ? Object.keys(rows[0]) : colsReq ?? [];
-          const cells = rows.map((r) => Object.values(r).map(toCell));
-          const quality = hasRules(rules) ? runQuality(rawCols, cells, rules) : null;
-          if (quality && !quality.passed && rules.block_on_fail) {
-            const msg = `Blocked by data quality rules: ${quality.issues.reduce((a, i) => a + i.count, 0)} issue(s) found. Nothing was loaded.`;
-            await admin.from("table_mappings").update({ status: "error", last_source_count: srcCount, last_dest_count: 0, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
-            await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: "blocked", source_count: srcCount, dest_count: 0, message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: { ...baseDetails, quality }, created_by: user.id });
-            return json({ ok: false, blocked: true, message: msg, quality });
-          }
-          const cols = rawCols.map(cleanCol);
-          const { before, after } = await withDriver(m.dest_connection_id, async (d) => {
-            await ensureTable(d, dst, cols, false);
-            const before = await countRows(d, dst);
-            await insertRows(d, dst, cols, cells);
-            return { before, after: await countRows(d, dst) };
-          });
-          const loaded = after - before;
-          const ok = loaded === srcCount;
-          const msg = ok ? `Validated: ${srcCount} source rows = ${loaded} loaded` : `Mismatch: ${srcCount} source vs ${loaded} loaded`;
-          await admin.from("table_mappings").update({ status: ok ? "success" : "mismatch", last_source_count: srcCount, last_dest_count: loaded, last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
-          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: ok ? "success" : "mismatch", source_count: srcCount, dest_count: loaded, message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: { ...baseDetails, quality, dest_before: before, dest_after: after }, created_by: user.id });
-          return json({ ok, source_count: srcCount, dest_count: loaded, message: msg, quality });
-        } catch (e) {
-          const msg = (e as Error).message;
-          await admin.from("table_mappings").update({ status: "error", last_message: msg, last_run_at: new Date().toISOString() }).eq("id", m.id);
-          await logJob({ job_type: "mapping", title: `${src} → ${dst}`, connection_id: m.dest_connection_id, target: dst, status: "error", message: msg, started_at: startedAt, duration_ms: Date.now() - started, details: baseDetails, created_by: user.id });
-          throw e;
-        }
+        return json(await runMapping(body.mapping_id, user.id));
       }
       default:
         return json({ error: "Unknown action" }, 400);

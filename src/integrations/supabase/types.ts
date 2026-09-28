@@ -100,6 +100,7 @@ export type Database = {
           id: string
           job_type: string
           message: string | null
+          schedule_id: string | null
           source_count: number | null
           started_at: string | null
           status: string
@@ -117,6 +118,7 @@ export type Database = {
           id?: string
           job_type: string
           message?: string | null
+          schedule_id?: string | null
           source_count?: number | null
           started_at?: string | null
           status?: string
@@ -134,6 +136,7 @@ export type Database = {
           id?: string
           job_type?: string
           message?: string | null
+          schedule_id?: string | null
           source_count?: number | null
           started_at?: string | null
           status?: string
@@ -146,6 +149,61 @@ export type Database = {
             columns: ["connection_id"]
             isOneToOne: false
             referencedRelation: "db_connections"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "etl_jobs_schedule_id_fkey"
+            columns: ["schedule_id"]
+            isOneToOne: false
+            referencedRelation: "schedules"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      notifications: {
+        Row: {
+          body: string | null
+          created_at: string
+          emailed_to: string[]
+          id: string
+          job_id: string | null
+          level: string
+          schedule_id: string | null
+          title: string
+        }
+        Insert: {
+          body?: string | null
+          created_at?: string
+          emailed_to?: string[]
+          id?: string
+          job_id?: string | null
+          level?: string
+          schedule_id?: string | null
+          title: string
+        }
+        Update: {
+          body?: string | null
+          created_at?: string
+          emailed_to?: string[]
+          id?: string
+          job_id?: string | null
+          level?: string
+          schedule_id?: string | null
+          title?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "notifications_job_id_fkey"
+            columns: ["job_id"]
+            isOneToOne: false
+            referencedRelation: "etl_jobs"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "notifications_schedule_id_fkey"
+            columns: ["schedule_id"]
+            isOneToOne: false
+            referencedRelation: "schedules"
             referencedColumns: ["id"]
           },
         ]
@@ -177,6 +235,63 @@ export type Database = {
           email?: string | null
           id?: string
           updated_at?: string
+        }
+        Relationships: []
+      }
+      schedules: {
+        Row: {
+          config: Json
+          created_at: string
+          created_by: string | null
+          cron: string
+          enabled: boolean
+          id: string
+          job_type: string
+          last_message: string | null
+          last_run_at: string | null
+          last_status: string | null
+          lock_until: string | null
+          name: string
+          next_run_at: string | null
+          notify_emails: string[]
+          recurrence: Json
+          timezone: string
+        }
+        Insert: {
+          config?: Json
+          created_at?: string
+          created_by?: string | null
+          cron: string
+          enabled?: boolean
+          id?: string
+          job_type: string
+          last_message?: string | null
+          last_run_at?: string | null
+          last_status?: string | null
+          lock_until?: string | null
+          name: string
+          next_run_at?: string | null
+          notify_emails?: string[]
+          recurrence?: Json
+          timezone?: string
+        }
+        Update: {
+          config?: Json
+          created_at?: string
+          created_by?: string | null
+          cron?: string
+          enabled?: boolean
+          id?: string
+          job_type?: string
+          last_message?: string | null
+          last_run_at?: string | null
+          last_status?: string | null
+          lock_until?: string | null
+          name?: string
+          next_run_at?: string | null
+          notify_emails?: string[]
+          recurrence?: Json
+          timezone?: string
         }
         Relationships: []
       }

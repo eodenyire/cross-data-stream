@@ -443,6 +443,30 @@ const FIX_FORMAT = {
   },
 };
 
+const MAP_FORMAT = {
+  name: "column_mapping",
+  schema: {
+    type: "object", additionalProperties: false, required: ["summary", "mappings", "rules", "unused_source_columns", "risks"],
+    properties: {
+      summary: { type: "string" },
+      mappings: {
+        type: "array",
+        items: {
+          type: "object", additionalProperties: false,
+          required: ["dest_column", "source_columns", "transformation", "sql_expression", "confidence", "explanation"],
+          properties: {
+            dest_column: { type: "string" }, source_columns: { type: "string" }, transformation: { type: "string" },
+            sql_expression: { type: "string" }, confidence: { type: "string", enum: ["high", "medium", "low"] }, explanation: { type: "string" },
+          },
+        },
+      },
+      rules: { type: "array", items: { type: "string" } },
+      unused_source_columns: { type: "array", items: { type: "string" } },
+      risks: { type: "array", items: { type: "string" } },
+    },
+  },
+};
+
 function isReadOnly(sql: string) {
   const s = sql.trim().replace(/;\s*$/, "");
   if (s.includes(";")) return false;
@@ -579,6 +603,39 @@ Deno.serve(async (req) => {
         const system = `You are a senior data quality engineer at Wekeza Bank helping a risk data analyst fix a failed data quality check before data is loaded. Given the validation report (rules checked, failing columns, counts and example rows) and the analyst's remediation context, recommend specific, practical fixes, most important first (at most 6). For each fix give: a short title; the problem in plain English; the concrete fix (e.g. a cleaning step, a changed rule, a source-system correction, a SQL UPDATE/SELECT on the staging table, or an Excel step); a short example (SQL, formula or rule change — empty string if none); the likely impact on row counts, downstream reports and risk figures; and the risk of applying it (e.g. data loss, hiding real problems). Never recommend simply deleting failing rows or disabling rules without explaining what is lost. Be concise; this is read by business analysts.`;
         const ans = await askModel(req, system, `Validation report:\n${report.slice(0, 12000)}\n\nRemediation context from the analyst:\n${context || "(none given)"}`, FIX_FORMAT);
         return json(ans);
+      }
+      case "ai_mapping": {
+        needPower();
+        const src = String(body.source_schema ?? "").trim().slice(0, 8000);
+        const dst = String(body.dest_schema ?? "").trim().slice(0, 8000);
+        const goal = String(body.outcome ?? "").trim().slice(0, 3000);
+        if (!src || !dst) throw new Error("Provide both the source and destination table schemas.");
+        const samples = String(body.samples ?? "").slice(0, 8000);
+        const system = `You are a senior data engineer at Wekeza Bank helping a risk data analyst map a source table onto a destination table. Using the source schema, destination schema, sample source rows and the desired outcome, recommend a mapping for EVERY destination column: which source column(s) feed it (empty string if none), the transformation rule in plain English, an example SQL expression (PostgreSQL) using the source column names, a confidence of high/medium/low, and a short explanation of why. Then list general transformation rules (e.g. trimming, date parsing, currency normalisation, deduplication), source columns left unused, and risks or open questions. Base type and format judgements on the sample rows. Be concise and specific; this is read by business analysts.`;
+        const ans = await askModel(req, system, `Source schema:\n${src}\n\nDestination schema:\n${dst}\n\nSample source rows:\n${samples || "(none)"}\n\nDesired outcome:\n${goal || "(not given)"}`, MAP_FORMAT);
+        return json(ans);
+      }
+      case "set_schedule_enabled":
+      case "delete_schedule": {
+        needPower();
+        const id = String(body.schedule_id ?? "");
+        const { data: ex } = await admin.from("schedules").select("created_by").eq("id", id).single();
+        const isAdmin = (roles ?? []).some((r) => r.role === "admin");
+        if (!ex || (ex.created_by !== user.id && !isAdmin)) throw new Error("Only the owner or an admin can change this schedule.");
+        if (action === "delete_schedule") {
+          await admin.from("notifications").update({ schedule_id: null }).eq("schedule_id", id);
+          await admin.from("etl_jobs").update({ schedule_id: null }).eq("schedule_id", id);
+          const { error } = await admin.from("schedules").delete().eq("id", id);
+          if (error) throw error;
+          return json({ ok: true });
+        }
+        const { data: s } = await admin.from("schedules").select("cron,timezone").eq("id", id).single();
+        const enabled = !!body.enabled;
+        let next: string | null = null;
+        if (enabled) { try { next = nextRun(s!.cron, s!.timezone); } catch { /* ignore */ } }
+        const { error } = await admin.from("schedules").update({ enabled, next_run_at: next }).eq("id", id);
+        if (error) throw error;
+        return json({ ok: true });
       }
       case "log_job": {
         const j = body.job ?? {};

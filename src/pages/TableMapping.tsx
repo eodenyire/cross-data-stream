@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import { ArrowRightLeft, Plus, Play, Loader2, Trash2 } from "lucide-react";
 import AppLayout from "@/components/AppLayout";
 import ConnectionSelect from "@/components/ConnectionSelect";
+import AIMappingAssistant from "@/components/AIMappingAssistant";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -101,6 +102,9 @@ export default function TableMapping() {
             <Plus className="h-4 w-4" /> Add Mapping
           </Button>
         </div>
+
+        <AIMappingAssistant />
+
 
         {mappings.length > 0 && (
           <div className="space-y-3">

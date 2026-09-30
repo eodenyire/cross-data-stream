@@ -12,6 +12,7 @@ import Connections from "./pages/Connections";
 import TableMapping from "./pages/TableMapping";
 import SQLWorkspace from "./pages/SQLWorkspace";
 import Ingestion from "./pages/Ingestion";
+import Schedules from "./pages/Schedules";
 import SettingsPage from "./pages/Settings";
 import Admin from "./pages/Admin";
 import NotFound from "./pages/NotFound";
@@ -35,6 +36,7 @@ const App = () => (
             <Route path="/mapping" element={protect(<TableMapping />)} />
             <Route path="/sql" element={protect(<SQLWorkspace />)} />
             <Route path="/ingestion" element={protect(<Ingestion />)} />
+            <Route path="/schedules" element={protect(<Schedules />)} />
             <Route path="/settings" element={protect(<SettingsPage />)} />
             <Route path="/admin" element={protect(<Admin />)} />
             <Route path="*" element={<NotFound />} />

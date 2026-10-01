@@ -477,9 +477,10 @@ function isReadOnly(sql: string) {
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   try {
-    const secret = Deno.env.get("SCHEDULER_SECRET");
-    if (req.headers.get("x-scheduler-secret")) {
-      if (!secret || req.headers.get("x-scheduler-secret") !== secret) return json({ error: "Forbidden" }, 403);
+    const given = req.headers.get("x-scheduler-secret");
+    if (given) {
+      const { data: k } = await admin.from("scheduler_key").select("secret").eq("id", 1).maybeSingle();
+      if (!k?.secret || given !== k.secret) return json({ error: "Forbidden" }, 403);
       return json({ ran: await tick() });
     }
     const auth = req.headers.get("Authorization") ?? "";

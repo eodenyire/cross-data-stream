@@ -1,0 +1,11 @@
+# Roadmap
+- [ ] Redeploy backend + test end to end (schedules, AI mapping)
+- [ ] Automatic schedule timer + scheduler key
+- [ ] Monitoring page (runs, filters, download details)
+- [ ] Alerts bell
+- [ ] AI SQL helper on SQL Workspace
+- [ ] AI fix suggestions screen (Ingestion quality report)
+- [ ] Data checks on Table Mapping
+- [ ] Shared files screen
+- [ ] File Converter: Parquet, row selection, save to shared folder
+- [ ] Email alerts — blocked: needs email domain

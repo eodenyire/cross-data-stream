@@ -238,6 +238,21 @@ export type Database = {
         }
         Relationships: []
       }
+      scheduler_key: {
+        Row: {
+          id: number
+          secret: string
+        }
+        Insert: {
+          id: number
+          secret: string
+        }
+        Update: {
+          id?: number
+          secret?: string
+        }
+        Relationships: []
+      }
       schedules: {
         Row: {
           config: Json

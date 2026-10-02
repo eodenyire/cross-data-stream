@@ -118,7 +118,7 @@ export default function SQLWorkspace() {
             </div>
             <div className="glass-card p-4 space-y-3">
               <h2 className="text-sm font-heading font-semibold flex items-center gap-2"><Terminal className="h-4 w-4 text-primary" /> Query Editor</h2>
-              <Textarea value={query} onChange={(e) => setQuery(e.target.value)}
+              <Textarea value={query} onChange={(e) => { setQuery(e.target.value); setAiGenerated(false); }}
                 className="font-mono text-sm min-h-[180px] bg-secondary/50 border-border/50" />
               <div className="flex flex-wrap items-center gap-2">
                 <Button onClick={handleRun} disabled={running || !query.trim() || !connectionId} className="gap-2">

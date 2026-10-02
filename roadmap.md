@@ -1,11 +1,11 @@
 # Roadmap
-- [ ] Redeploy backend + test end to end (schedules, AI mapping)
-- [ ] Automatic schedule timer + scheduler key
-- [ ] Monitoring page (runs, filters, download details)
-- [ ] Alerts bell
-- [ ] AI SQL helper on SQL Workspace
-- [ ] AI fix suggestions screen (Ingestion quality report)
+- [x] Automatic schedule timer (confirmed: "Test conv" ran on its own at 06:00 Nairobi)
+- [x] Monitoring page + alerts bell
+- [x] AI SQL helper box on SQL Workspace
+- [x] File Converter end-to-end (Excel → CSV → shared folder)
+- [ ] Email alerts — blocked: needs an email domain the bank owns
+- [ ] Connect real Wekeza databases — blocked: needs host/user/password from user (and VPN for internal SQL Server/Oracle)
+- [ ] AI fix suggestions screen
 - [ ] Data checks on Table Mapping
 - [ ] Shared files screen
-- [ ] File Converter: Parquet, row selection, save to shared folder
-- [ ] Email alerts — blocked: needs email domain
+- [ ] Clean up test data

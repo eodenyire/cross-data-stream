@@ -15,6 +15,7 @@ import Ingestion from "./pages/Ingestion";
 import Schedules from "./pages/Schedules";
 import SettingsPage from "./pages/Settings";
 import Admin from "./pages/Admin";
+import Monitoring from "./pages/Monitoring";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -37,6 +38,7 @@ const App = () => (
             <Route path="/sql" element={protect(<SQLWorkspace />)} />
             <Route path="/ingestion" element={protect(<Ingestion />)} />
             <Route path="/schedules" element={protect(<Schedules />)} />
+            <Route path="/monitoring" element={protect(<Monitoring />)} />
             <Route path="/settings" element={protect(<SettingsPage />)} />
             <Route path="/admin" element={protect(<Admin />)} />
             <Route path="*" element={<NotFound />} />

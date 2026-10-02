@@ -13,6 +13,7 @@ import {
   LogOut,
   ShieldCheck,
   CalendarClock,
+  Activity,
 } from "lucide-react";
 import wekezaLogo from "@/assets/wekeza-logo.png";
 import { useAuth } from "@/hooks/useAuth";
@@ -27,6 +28,7 @@ const baseNavItems = [
   { icon: Terminal, label: "SQL Workspace", path: "/sql" },
   { icon: FolderOutput, label: "Ingestion", path: "/ingestion" },
   { icon: CalendarClock, label: "Schedules", path: "/schedules" },
+  { icon: Activity, label: "Monitoring", path: "/monitoring" },
   { icon: Settings, label: "Settings", path: "/settings" },
 ];
 

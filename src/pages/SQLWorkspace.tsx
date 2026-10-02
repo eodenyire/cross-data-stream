@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { Play, Download, Copy, Loader2, Terminal, TableIcon } from "lucide-react";
+import { Play, Download, Copy, Loader2, Terminal, TableIcon, Sparkles } from "lucide-react";
+import { Input } from "@/components/ui/input";
 import * as XLSX from "xlsx";
 import Papa from "papaparse";
 import { saveAs } from "file-saver";
@@ -25,6 +26,21 @@ export default function SQLWorkspace() {
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
   const [exportFormat, setExportFormat] = useState("xlsx");
+  const [question, setQuestion] = useState("");
+  const [asking, setAsking] = useState(false);
+  const [ai, setAi] = useState<{ sql: string; explanation: string; assumptions: string[]; safe: boolean; warning: string | null } | null>(null);
+  const [aiGenerated, setAiGenerated] = useState(false);
+
+  const handleAsk = async () => {
+    if (!question.trim() || !connectionId) return;
+    setAsking(true); setAi(null);
+    try {
+      const r = await dbHub("ai_sql", { connection_id: connectionId, question });
+      setAi(r);
+      if (r.sql && r.safe) { setQuery(r.sql); setAiGenerated(true); }
+    } catch (e: any) { toast.error(e.message); }
+    setAsking(false);
+  };
 
   useEffect(() => {
     if (!connectionId) return;
@@ -35,7 +51,7 @@ export default function SQLWorkspace() {
   const handleRun = async () => {
     setRunning(true); setError(""); setResults(null); setMeta(null);
     try {
-      const r = await dbHub("query", { connection_id: connectionId, sql: query });
+      const r = await dbHub("query", { connection_id: connectionId, sql: query, ai_generated: aiGenerated });
       setResults(r.rows); setMeta({ total: r.total, truncated: r.truncated, ms: r.ms });
     } catch (e: any) { setError(e.message); }
     setRunning(false);
@@ -83,8 +99,26 @@ export default function SQLWorkspace() {
 
           <div className="space-y-4 min-w-0">
             <div className="glass-card p-4 space-y-3">
+              <h2 className="text-sm font-heading font-semibold flex items-center gap-2"><Sparkles className="h-4 w-4 text-primary" /> Ask in plain English</h2>
+              <div className="flex gap-2">
+                <Input value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleAsk()}
+                  placeholder="e.g. Total loan balance by branch for last month" />
+                <Button onClick={handleAsk} disabled={asking || !question.trim() || !connectionId} className="gap-2 shrink-0">
+                  {asking ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />} Write query
+                </Button>
+              </div>
+              {ai && (
+                <div className="rounded-lg bg-secondary/40 p-3 space-y-2 text-sm">
+                  {ai.warning && <p className="text-destructive">{ai.warning}</p>}
+                  <p>{ai.explanation}</p>
+                  {ai.assumptions?.length > 0 && <ul className="list-disc pl-5 text-xs text-muted-foreground">{ai.assumptions.map((a, i) => <li key={i}>{a}</li>)}</ul>}
+                  {ai.sql && ai.safe && <p className="text-xs text-primary">Query placed in the editor below. Review it, then run.</p>}
+                </div>
+              )}
+            </div>
+            <div className="glass-card p-4 space-y-3">
               <h2 className="text-sm font-heading font-semibold flex items-center gap-2"><Terminal className="h-4 w-4 text-primary" /> Query Editor</h2>
-              <Textarea value={query} onChange={(e) => setQuery(e.target.value)}
+              <Textarea value={query} onChange={(e) => { setQuery(e.target.value); setAiGenerated(false); }}
                 className="font-mono text-sm min-h-[180px] bg-secondary/50 border-border/50" />
               <div className="flex flex-wrap items-center gap-2">
                 <Button onClick={handleRun} disabled={running || !query.trim() || !connectionId} className="gap-2">
